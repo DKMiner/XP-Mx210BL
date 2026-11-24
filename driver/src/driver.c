@@ -108,7 +108,9 @@ XpmxGetRemoteDeviceInfo(
     WDFREQUEST request = NULL;
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_MEMORY_DESCRIPTOR output;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
 
+    Context->DeviceInfoReady = FALSE;
     RtlZeroMemory(&Context->RemoteDeviceInfo, sizeof(Context->RemoteDeviceInfo));
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
@@ -131,13 +133,19 @@ XpmxGetRemoteDeviceInfo(
         sizeof(Context->RemoteDeviceInfo)
         );
 
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, 0);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(
+        &sendOptions,
+        WDF_REL_TIMEOUT_IN_SEC(12)
+        );
+
     status = WdfIoTargetSendInternalIoctlSynchronously(
         Context->IoTarget,
         request,
         IOCTL_INTERNAL_BTHENUM_GET_DEVINFO,
         NULL,
         &output,
-        NULL,
+        &sendOptions,
         NULL
         );
 
@@ -216,6 +224,8 @@ XpmxOpenL2capChannel(
         XpmxLogStatus("BthAllocateBrb(OPEN_CHANNEL)", STATUS_INSUFFICIENT_RESOURCES);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+
+    Context->ProfileInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_OPEN_CHANNEL);
 
     brb->BtAddress = Context->RemoteDeviceInfo.address;
     brb->Psm = Psm;
@@ -298,6 +308,8 @@ XpmxCloseL2capChannel(
         *ChannelHandle = NULL;
         return;
     }
+
+    Context->ProfileInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_CLOSE_CHANNEL);
 
     brb->BtAddress = Context->RemoteDeviceInfo.address;
     brb->ChannelHandle = *ChannelHandle;
@@ -397,6 +409,9 @@ XpmxEvtSelfManagedIoInit(
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
 
     InterlockedExchange(&context->RemoteDisconnected, 0);
+    context->DeviceInfoReady = FALSE;
+    context->ControlChannel = NULL;
+    context->InterruptChannel = NULL;
 
     status = XpmxGetRemoteDeviceInfo(context);
     if (!NT_SUCCESS(status)) {
