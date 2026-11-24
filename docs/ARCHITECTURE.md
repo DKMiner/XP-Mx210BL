@@ -72,3 +72,10 @@ Patching a Microsoft inbox binary would be fragile, difficult to maintain, and w
 - The controller-specific INF must contain the exact HID service + VID + PID match.
 - Keep an explicit uninstall/rollback procedure in the eventual package.
 - Use a separate test environment where possible; a kernel driver bug can crash Windows.
+
+
+## Setup class and virtual HID separation
+
+The INF intentionally uses the Windows **Bluetooth** setup class, following Microsoft's Bluetooth profile-driver installation model. The current inbox HidBth package classifies its device node as HIDClass because it is itself a HID transport driver; this prototype instead owns the Bluetooth profile service and does not expose raw HID transport callbacks on that PDO. The gamepad that applications consume will be a separate virtual HID child created through VHF, where the HID class stack is appropriate.
+
+The targeted match remains the remote HID service UUID plus VID 1949 / PID 0402. Microsoft's Bluetooth INF documentation explicitly supports service-GUID hardware IDs augmented with remote VID/PID values, and says Bluetooth profile devices belong to the Bluetooth setup class.
