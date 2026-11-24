@@ -4,6 +4,10 @@
 #include <bthioctl.h>
 #include <bthddi.h>
 
+// Instantiate the Bluetooth profile-interface GUID in this translation unit.
+#include <initguid.h>
+#include <bthguid.h>
+
 #define XPMX_POOL_TAG 'xMpX'
 #define XPMX_CONTROL_PSM 0x0011
 #define XPMX_INTERRUPT_PSM 0x0013
@@ -171,7 +175,7 @@ VOID
 XpmxL2capIndicationCallback(
     _In_ PVOID CallbackContext,
     _In_ INDICATION_CODE Indication,
-    _In_ PINDICATION_PARAMETERS_ENHANCED Parameters
+    _In_ PINDICATION_PARAMETERS Parameters
     )
 {
     PDEVICE_CONTEXT context = (PDEVICE_CONTEXT)CallbackContext;
