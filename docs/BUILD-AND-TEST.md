@@ -1,49 +1,48 @@
-# Build and test workflow
+# Stage 1 driver: L2CAP probe
 
-This file will be expanded as the KMDF project and installer are implemented.
+This is a development prototype, not an installable release.
 
-## Development tools
+## What it currently does
 
-- Windows 10/11 x64 development host
-- Visual Studio 2022 with Desktop development with C++
-- Windows Driver Kit (WDK) and matching Windows SDK
-- Microsoft Windows Driver Samples repository for API examples
+When the XP-Mx210BL's Bluetooth HID service PDO starts, the driver:
 
-## Milestones
+1. Queries GUID_BTHDDI_PROFILE_DRIVER_INTERFACE.
+2. Gets the paired remote device address through IOCTL_INTERNAL_BTHENUM_GET_DEVINFO.
+3. Sends BRB_L2CA_OPEN_CHANNEL to HID Control PSM 0x0011.
+4. Sends BRB_L2CA_OPEN_CHANNEL to HID Interrupt PSM 0x0013.
+5. Logs the request status, Bluetooth BRB status, negotiated MTUs and channel handles.
+6. Closes successfully opened channels during orderly device cleanup.
 
-### P0 — Repository and design
+The initial probe uses basic L2CAP mode and an incoming queue depth of 10. BRB submissions have a 12-second request timeout.
 
-- [x] Capture controller identity and protocol observations.
-- [x] Identify Microsoft Bluetooth L2CAP client-profile sample.
-- [x] Select a controller-specific `BTHENUM` match.
-- [ ] Add KMDF driver project and INF.
-- [ ] Build x64 Debug configuration.
+## What it does not do yet
 
-### P1 — L2CAP connection probe
+- It does not receive ACL transfer data from the Interrupt channel.
+- It does not implement HIDP SET_PROTOCOL / GET_REPORT / SET_REPORT handling.
+- It does not parse the gamepad report.
+- It does not create a VHF virtual HID device.
+- It does not retry the connection automatically if the controller is powered off when the service node starts.
 
-- [ ] Query Bluetooth profile-driver interface.
-- [ ] Retrieve remote BD_ADDR from the BTHENUM PDO.
-- [ ] Open Control PSM `0x0011`.
-- [ ] Open Interrupt PSM `0x0013`.
-- [ ] Log completion status and negotiated MTU for each.
-- [ ] Close both channels reliably on removal/disconnect.
-- [ ] Confirm driver failure does not leave stale channel handles.
+For the first hardware test, the controller should be awake in HOME+X mode when the device node is started. If the node has already started while the controller was off, restart only this Bluetooth HID service device after the controller is awake; do not remove the pairing.
 
-### P2 — HIDP receive path
+## Build
 
-- [ ] Add inbound `BRB_L2CA_ACL_TRANSFER` on the Interrupt channel.
-- [ ] Capture raw reports and compare them with Android's successful trace.
-- [ ] Validate report ID, lengths, and disconnect behavior.
+Open XpMx210BL.vcxproj in Visual Studio 2022 with the WDK integration installed. Select Debug | x64 and build.
 
-### P3 — Virtual gamepad
+The project has not yet been built in this environment. Resolve all compiler and WDK warnings before considering installation.
 
-- [ ] Add the exact captured HID Report Descriptor as a binary fixture.
-- [ ] Implement VHF source device descriptor and callbacks.
-- [ ] Forward validated gamepad reports to VHF.
-- [ ] Verify axes, hat, buttons, and neutral values in Windows game-controller properties.
+## Logging
 
-## Installation policy
+The prototype uses DbgPrintEx with the [XP-Mx210BL] prefix. Capture kernel debug output with a kernel debugger or a trusted debug-output viewer configured to capture kernel messages. The expected messages identify:
 
-No INF installation instructions are provided until the driver is implemented, reviewed, and built. The eventual package must bind only to the exact XP-Mx210BL HID service hardware ID and must include tested rollback steps.
+- profile interface query result
+- remote BD_ADDR retrieval result
+- Control PSM open result
+- Interrupt PSM open result
+- channel-close result
 
-Kernel-driver testing can crash Windows. Prefer a separate test environment. Do not test an unreviewed build on a machine you rely on.
+Record the complete output, not just the last line.
+
+## Installation safety
+
+Do not use this INF yet. Before installation, the project needs a WDK build, a review of the generated INF/catalog, and a separate rollback procedure. A kernel-mode driver can crash Windows; test in a recoverable environment and retain a way to restore the inbox profile driver.
