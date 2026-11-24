@@ -13,7 +13,7 @@ When the XP-Mx210BL's Bluetooth HID service PDO starts, the driver:
 5. Logs the request status, Bluetooth BRB status, negotiated MTUs and channel handles.
 6. Closes successfully opened channels during orderly device cleanup.
 
-The initial probe uses basic L2CAP mode and an incoming queue depth of 10. BRB submissions have a 12-second request timeout.
+The initial probe uses basic L2CAP mode and an incoming queue depth of 10. BRB submissions and the remote-device-info query have a 12-second request timeout. BRBs are allocated and reinitialized through BTH_PROFILE_DRIVER_INTERFACE.
 
 ## What it does not do yet
 
@@ -22,6 +22,7 @@ The initial probe uses basic L2CAP mode and an incoming queue depth of 10. BRB s
 - It does not parse the gamepad report.
 - It does not create a VHF virtual HID device.
 - It does not retry the connection automatically if the controller is powered off when the service node starts.
+- It does not yet manage channel teardown/reopen across sleep, hibernate, or D0 power transitions.
 
 For the first hardware test, the controller should be awake in HOME+X mode when the device node is started. If the node has already started while the controller was off, restart only this Bluetooth HID service device after the controller is awake; do not remove the pairing.
 
