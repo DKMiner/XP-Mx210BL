@@ -55,6 +55,7 @@ XpmxSendBrbSynchronously(
     WDFREQUEST request = NULL;
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_MEMORY_DESCRIPTOR otherArg1;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = Context->Device;
@@ -76,6 +77,12 @@ XpmxSendBrbSynchronously(
         BrbSize
         );
 
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, 0);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(
+        &sendOptions,
+        WDF_REL_TIMEOUT_IN_SEC(12)
+        );
+
     status = WdfIoTargetSendInternalIoctlOthersSynchronously(
         Context->IoTarget,
         request,
@@ -83,7 +90,7 @@ XpmxSendBrbSynchronously(
         &otherArg1,
         NULL,
         NULL,
-        NULL,
+        &sendOptions,
         NULL
         );
 
@@ -141,8 +148,8 @@ XpmxGetRemoteDeviceInfo(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
-            "[XP-Mx210BL] Remote BD_ADDR=0x%012llX\n",
-            (unsigned long long)Context->RemoteDeviceInfo.address
+            "[XP-Mx210BL] Remote BD_ADDR=0x%012I64X\n",
+            Context->RemoteDeviceInfo.address
             );
     } else {
         XpmxLogStatus("IOCTL_INTERNAL_BTHENUM_GET_DEVINFO", status);
@@ -252,11 +259,12 @@ XpmxOpenL2capChannel(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
-            "[XP-Mx210BL] %s failed: PSM=0x%04X NTSTATUS=0x%08X BRB_STATUS=0x%08X\n",
+            "[XP-Mx210BL] %s failed: PSM=0x%04X NTSTATUS=0x%08X BRB_STATUS=0x%08X BTH_STATUS=0x%08X\n",
             ChannelName,
             Psm,
             (ULONG)status,
-            (ULONG)brb->Hdr.Status
+            (ULONG)brb->Hdr.Status,
+            (ULONG)brb->Hdr.BtStatus
             );
     }
 
