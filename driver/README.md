@@ -1,51 +1,63 @@
-# Stage 2 driver: L2CAP receive probe
+# Stage 3 driver: VHF gamepad bridge
 
-This is a development prototype, not a production release.
+This is a test-signed development prototype, not a production release.
 
-## What it currently does
+## Current implementation
 
-When the XP-Mx210BL's Bluetooth HID service PDO starts, the driver:
+When the XP-Mx210BL Bluetooth HID service PDO starts, the driver:
 
-1. Queries GUID_BTHDDI_PROFILE_DRIVER_INTERFACE.
-2. Gets the paired remote device address through IOCTL_INTERNAL_BTHENUM_GET_DEVINFO.
-3. Opens HID Control L2CAP PSM 0x0011 with BRB_L2CA_OPEN_CHANNEL.
-4. Opens HID Interrupt L2CAP PSM 0x0013 with BRB_L2CA_OPEN_CHANNEL.
-5. Starts one pending inbound BRB_L2CA_ACL_TRANSFER read on the Interrupt channel.
-6. Re-submits the read after each successful completion and logs the first 16 bytes of each received transfer.
-7. Tracks Control and Interrupt channel handles separately. A remote disconnect invalidates that channel handle, requests immediate channel rundown, and cancels the pending Interrupt read.
-8. Stops the reader before orderly channel cleanup.
+1. Creates and starts a VHF virtual HID child using the captured Game Pad-only report descriptor.
+2. Queries GUID_BTHDDI_PROFILE_DRIVER_INTERFACE.
+3. Gets the paired remote device address through IOCTL_INTERNAL_BTHENUM_GET_DEVINFO.
+4. Opens HID Control L2CAP PSM 0x0011 and HID Interrupt L2CAP PSM 0x0013.
+5. Starts one pending inbound BRB_L2CA_ACL_TRANSFER read on the Interrupt channel and re-submits it after successful completion.
+6. Validates 12-byte HIDP DATA/INPUT packets with Report ID 0x07.
+7. Removes only the leading HIDP packet header (0xA1) and submits the remaining 11-byte report (ID byte plus ten payload bytes) to VHF through HID_XFER_PACKET / VhfReadReportSubmit.
+8. Uses VHF's default report buffering, so the receive buffer can be reused after VhfReadReportSubmit returns.
+9. Stops the pending read before deleting the VHF child and closing any still-valid L2CAP channels.
 
-The initial channels use Basic L2CAP mode, an incoming queue depth of 10, and MTU negotiation up to the observed 672-byte channel MTU. The remote-device-info query and synchronous open/close BRBs have 12-second request timeouts. The continuous read has no BRB timeout; it remains pending until data arrives or the request is canceled.
+The VHF child uses VID 0x1949 and PID 0x0402, matching the observed controller SDP/PnP identity. Its descriptor contains only the Game Pad top-level collection (Report ID 0x07), not the Consumer Control or Mouse collections from the full physical descriptor.
 
-## What it does not do yet
+## Known limitations
 
-- It does not implement HIDP SET_PROTOCOL, GET_REPORT, or SET_REPORT transactions on the Control channel.
-- It does not validate HIDP framing or parse the controller's report descriptor.
-- It does not create a VHF virtual HID device.
-- It does not automatically reopen channels after a remote disconnect while the PnP node remains started. Restarting only this Bluetooth HID service device currently retries the connection.
-- It does not yet manage channel teardown/reopen across sleep, hibernate, or D0 power transitions.
+- The Stage 3 VHF source integration has not yet been built or hardware-tested on the target laptop.
+- The driver does not implement HIDP Control-channel SET_PROTOCOL, GET_REPORT, or SET_REPORT transactions.
+- No HID output reports, rumble, or force feedback are implemented.
+- Automatic channel reconnection after a remote disconnect is not implemented. Restarting this Bluetooth HID service device retries opening both channels.
+- Sleep/hibernate and D0 power-transition recovery are not implemented.
 
-For testing, pair the controller as usual and wake it in HOME+X mode before starting/restarting the Bluetooth HID service node. Do not remove the pairing to retry the transport. Press buttons or move the controls briefly while DebugView is capturing kernel output; look for [XP-Mx210BL] HID Interrupt RX lines.
+## Build and package
 
-## Build
+Open XpMx210BL.vcxproj in Visual Studio 2022 with the WDK integration installed. Select Debug | x64 and rebuild.
 
-Open XpMx210BL.vcxproj in Visual Studio 2022 with the WDK integration installed. Select Debug | x64 and build.
+The project links VhfKm.lib. The INF adds the in-box VHF service as a lower filter using the same LowerFilters pattern as Microsoft's HIDInjector VHF sample. Verify the generated INF includes that entry and that the catalog signature verifies before installation.
 
-The Stage 1 transport probe was built and run on the target machine. The Stage 2 receive-reader revision has not yet been built or hardware-tested. Resolve all compiler and WDK warnings before installing the revised package.
+## Test
+
+1. Build Debug | x64.
+2. Regenerate the package using the WDK/Inf2Cat target; this machine uses Inf2Cat local time.
+3. Verify the generated catalog with SignTool /pa.
+4. Start DebugView as administrator with Capture Events and Capture Kernel enabled.
+5. Wake the controller in HOME+X mode.
+6. Install the new package using pnputil /add-driver <package-inf> /install.
+7. Confirm the Bluetooth service node is Started and bound to the newly published oemNN.inf.
+8. Look for the VHF gamepad child and the log message VHF gamepad child started.
+9. Run joy.cpl and test the axes, hat, and buttons.
+
+The Stage 2 receive-probe package already proved that packets arrive. The Stage 3 package is the first revision that forwards them to VHF; do not expect a usable Windows gamepad until this revision builds, installs, and the VHF child starts.
 
 ## Logging
 
-The driver uses DbgPrintEx with the [XP-Mx210BL] prefix. Capture kernel debug output with DebugView running as administrator and Kernel Capture enabled. The registry component filter should include informational messages (IHVDRIVER=0xF).
+The driver emits one compact DebugView line per received Interrupt packet, plus messages for VhfCreate, VhfStart, VhfReadReportSubmit, and VhfDelete. Keep the capture short if you are pressing buttons continuously.
 
-Expected receive messages identify:
-- Control and Interrupt channel open results and negotiated MTUs
-- Continuous Interrupt reader startup
-- Individual Interrupt read completions, including transfer length, remaining buffer space, and the first 16 bytes
-- Remote disconnect reason and channel identity
-- Read cancellation or failure during teardown
+## Rollback
 
-Keep captures short while the controller is sending reports because the reader logs each received transfer. Save the complete capture, not only the last line.
+Record the actual published oemNN.inf name returned by PnPUtil. To remove only the new prototype package, use:
 
-## Installation safety
+pnputil /delete-driver oemNN.inf /uninstall
 
-This is still a test-signed kernel-mode prototype. Review the generated INF/CAT/SYS package before installing each revision. Retain the published oemNN.inf name for rollback; remove only the prototype package and do not force-delete unrelated Bluetooth packages.
+Then ask PnP to rescan:
+
+pnputil /scan-devices
+
+Do not use /force. Keep the previously working receive-probe package available until the VHF child has been verified.
