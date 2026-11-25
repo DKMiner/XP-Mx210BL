@@ -1065,9 +1065,10 @@ XpmxConnectHidSession(
         Trigger
         );
 
-    // Drain the old reader before disposing it or touching either channel.
+    // Stop the reader first, but keep its request/context alive until both
+    // channel-close operations have completed. A disconnect callback can
+    // still be in flight after it invalidates a channel handle.
     XpmxStopInterruptReader(Context);
-    XpmxUninitializeInterruptReader(Context);
 
     status = XpmxCloseL2capChannel(Context, &Context->InterruptChannel);
     if (!NT_SUCCESS(status) &&
@@ -1080,6 +1081,10 @@ XpmxConnectHidSession(
         XpmxGetChannelHandle(&Context->ControlChannel) != NULL) {
         return status;
     }
+
+    // Now that both channel-close operations have completed, the old
+    // disconnect callback can no longer need the interrupt request.
+    XpmxUninitializeInterruptReader(Context);
 
     XpmxResetChannel(&Context->ControlChannel);
     XpmxResetChannel(&Context->InterruptChannel);
