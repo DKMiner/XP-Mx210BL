@@ -25,7 +25,7 @@ XpMx210BL.sys=1
 %Manufacturer%=Models,NTamd64.10.0...16299
 
 [Models.NTamd64.10.0...16299]
-%DeviceDesc%=Install, BTHENUM\\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
+%DeviceDesc%=Install, BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
 
 [Install.NT]
 CopyFiles=DriverCopy
@@ -49,7 +49,7 @@ DisplayName=%ServiceDesc%
 ServiceType=1
 StartType=3
 ErrorControl=1
-ServiceBinary=%13%\\XpMx210BL.sys
+ServiceBinary=%13%\XpMx210BL.sys
 
 [Install.NT.Wdf]
 KmdfService=XpMx210BL,WdfSection
