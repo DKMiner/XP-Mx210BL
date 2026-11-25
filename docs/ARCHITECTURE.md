@@ -10,53 +10,54 @@ No Android bridge, no iCade keyboard mapping, no permanently attached USB Blueto
 
 Windows' Bluetooth enumerator creates a PnP node for each remote service. Microsoft documents these hardware-ID patterns:
 
-- `BTHENUM\\{ServiceGUID}_VID&...`
-- `BTHENUM\\{ServiceGUID}_VID&..._PID&...`
-- compatible ID `BTHENUM\\{ServiceGUID}`
+- BTHENUM\{ServiceGUID}_VID&...
+- BTHENUM\{ServiceGUID}_VID&..._PID&...
+- compatible ID BTHENUM\{ServiceGUID}
 
 The HID service GUID is:
 
-```text
 00001124-0000-1000-8000-00805F9B34FB
-```
 
 The controller's observed node contains:
 
-```text
-BTHENUM\\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
-```
+BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
 
-The intended INF match is this **specific** service + VID + PID hardware ID. The purpose is to outrank the generic inbox HID Bluetooth profile match for this controller only.
+The intended INF match is this specific service + VID + PID hardware ID. The purpose is to outrank the generic inbox HID Bluetooth profile match for this controller only.
 
-Do not match the generic `BTHENUM\\{00001124...}` compatible ID unless deliberately testing broadly. Do not bind to or replace the Intel Bluetooth radio driver.
+Do not match the generic BTHENUM HID compatible ID unless deliberately testing broadly. Do not bind to or replace the Intel Bluetooth radio driver.
 
 ## Transport layer
 
-The profile driver attaches to the controller's HID service PDO. It obtains the Bluetooth profile-driver interface (`GUID_BTHDDI_PROFILE_DRIVER_INTERFACE`) and uses the default I/O target to send `IOCTL_INTERNAL_BTH_SUBMIT_BRB` requests to `BthPort.sys`.
+The profile driver attaches to the controller's HID service PDO. It obtains the Bluetooth profile-driver interface (GUID_BTHDDI_PROFILE_DRIVER_INTERFACE) and uses the default I/O target to send IOCTL_INTERNAL_BTH_SUBMIT_BRB requests to BthPort.sys.
 
-Initial connection sequence:
+Connection sequence:
 
 1. Query the profile-driver interface.
-2. Retrieve the remote Bluetooth address using `IOCTL_INTERNAL_BTHENUM_GET_DEVINFO`.
-3. Open HID Control L2CAP PSM `0x0011` with `BRB_L2CA_OPEN_CHANNEL`.
-4. Open HID Interrupt L2CAP PSM `0x0013` with `BRB_L2CA_OPEN_CHANNEL`.
-5. Log the NTSTATUS, Bluetooth BRB status, negotiated MTU, and channel handle for each operation.
-6. Close channels using `BRB_L2CA_CLOSE_CHANNEL` on orderly device removal and disconnect.
+2. Retrieve the remote Bluetooth address using IOCTL_INTERNAL_BTHENUM_GET_DEVINFO.
+3. Open HID Control L2CAP PSM 0x0011 with BRB_L2CA_OPEN_CHANNEL.
+4. Open HID Interrupt L2CAP PSM 0x0013 with BRB_L2CA_OPEN_CHANNEL.
+5. Start a pending inbound BRB_L2CA_ACL_TRANSFER request on the Interrupt channel. After each successful read, the completion routine queues a DPC that re-submits the read.
+6. Log the transferred length, remaining buffer size, and first 16 bytes of each received Interrupt-channel transfer.
 
-The first milestone does not send HIDP commands or create a VHF device. It only proves that the replacement profile driver can use the existing radio and open both channels.
+The profile callback is channel-specific. When a remote disconnect is indicated, it invalidates only the matching channel handle, sets the CloseNow response so the Bluetooth stack can finish tearing down that channel, and cancels the continuous Interrupt read when appropriate. PnP cleanup stops and drains the read before closing still-valid channels.
 
-Use Basic L2CAP mode initially, with conservative MTU negotiation and an incoming queue depth of 10 (Microsoft's documented recommendation). The controller's captured SDP record indicates fixed PSMs; a new SDP query is not necessary for this first probe.
+The driver currently does not autonomously reopen channels after a remote disconnect while the service node remains started. Restarting this specific PnP device re-runs the open sequence. Automatic reconnect and power-transition recovery are separate work items.
 
-## Input and virtual HID
+The controller's captured SDP record indicates fixed PSMs; a new SDP query is not necessary for this first probe. Basic L2CAP mode is used initially, with the observed 672-byte MTU and an incoming queue depth of 10.
 
-After both channels open:
+## HIDP and virtual HID
 
-1. Receive interrupt-channel packets using `BRB_L2CA_ACL_TRANSFER` with inbound direction.
-2. Validate HIDP framing and report IDs.
-3. Preserve the original descriptor and report bytes as protocol fixtures.
-4. Send valid HID input reports through a VHF-backed HID source device.
+The current receive stage only records raw Interrupt-channel bytes. It does not implement the HIDP state machine.
 
-VHF is a separate logical HID device stack. The Bluetooth profile driver can be the report source, but it must submit the descriptor and input reports through the documented VHF API rather than pretending that raw L2CAP packets are already Windows HID reports.
+Next steps after validating the received reports:
+
+1. Capture complete input report payloads and compare them with the Android btsnoop trace.
+2. Implement the required HIDP control-channel transactions and report handling.
+3. Validate report IDs, lengths, and the captured 208-byte report descriptor.
+4. Preserve the original descriptor and report bytes as protocol fixtures.
+5. Submit validated gamepad input reports through a VHF-backed HID source device.
+
+VHF is a separate logical HID device stack. The Bluetooth profile driver can be the report source, but it must submit the descriptor and input reports through the documented VHF API rather than pretending raw L2CAP packets are already Windows HID reports.
 
 The final virtual gamepad should expose the captured gamepad collection, not the mouse or Consumer Control collection unless later desired.
 
@@ -66,16 +67,15 @@ Patching a Microsoft inbox binary would be fragile, difficult to maintain, and w
 
 ## Safety and rollback principles
 
-- Development stays on branch `work/l2cap-probe`.
-- Do not install a prototype kernel driver on the primary Windows installation before it builds cleanly and has been reviewed.
+- Development stays on branch work/l2cap-probe.
+- Do not install a new prototype revision until it builds cleanly and the generated INF/CAT/SYS package has been checked.
 - Never replace the Intel radio driver.
 - The controller-specific INF must contain the exact HID service + VID + PID match.
-- Keep an explicit uninstall/rollback procedure in the eventual package.
+- Keep an explicit uninstall/rollback procedure for each published oemNN.inf package.
 - Use a separate test environment where possible; a kernel driver bug can crash Windows.
-
 
 ## Setup class and virtual HID separation
 
-The INF intentionally uses the Windows **Bluetooth** setup class, following Microsoft's Bluetooth profile-driver installation model. The current inbox HidBth package classifies its device node as HIDClass because it is itself a HID transport driver; this prototype instead owns the Bluetooth profile service and does not expose raw HID transport callbacks on that PDO. The gamepad that applications consume will be a separate virtual HID child created through VHF, where the HID class stack is appropriate.
+The INF intentionally uses the Windows Bluetooth setup class, following Microsoft's Bluetooth profile-driver installation model. The current inbox HidBth package classifies its device node as HIDClass because it is itself a HID transport driver; this prototype instead owns the Bluetooth profile service and does not expose raw HID transport callbacks on that PDO. The gamepad that applications consume will be a separate virtual HID child created through VHF, where the HID class stack is appropriate.
 
-The targeted match remains the remote HID service UUID plus VID 1949 / PID 0402. Microsoft's Bluetooth INF documentation explicitly supports service-GUID hardware IDs augmented with remote VID/PID values, and says Bluetooth profile devices belong to the Bluetooth setup class.
+The targeted match remains the remote HID service UUID plus VID 1949 / PID 0402.
