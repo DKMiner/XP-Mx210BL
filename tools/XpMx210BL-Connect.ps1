@@ -116,7 +116,7 @@ internal sealed class XpmxConnectForm : Form
 
     public XpmxConnectForm()
     {
-        Text = "XP-Mx210BL — Bluetooth connection";
+        Text = "XP-Mx210BL - Bluetooth connection";
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -145,7 +145,7 @@ internal sealed class XpmxConnectForm : Form
         Controls.Add(connectButton);
 
         statusLabel = new Label();
-        statusLabel.Text = "Ready — no background retries or polling.";
+        statusLabel.Text = "Ready - no background retries or polling.";
         statusLabel.AutoSize = false;
         statusLabel.Size = new Size(395, 42);
         statusLabel.Location = new Point(22, 137);
