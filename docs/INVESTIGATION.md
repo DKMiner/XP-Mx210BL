@@ -14,7 +14,7 @@ This document records observations from the XP-Mx210BL Windows Bluetooth investi
 ## Controller identity
 
 - Friendly name: `XP-Mx210BL`
-- Bluetooth address: `00:90:E1:5C:17:C2`
+- Bluetooth address: `the XP-Mx210BL controller`
 - HID service UUID: `00001124-0000-1000-8000-00805F9B34FB`
 - PnP service instance observed:
   `BTHENUM\\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402\\...`
@@ -133,14 +133,18 @@ The changing values in the axis, hat, and button portions match the HOME+X Game 
 
 The receive logger was subsequently changed to print each packet as one compact DebugView line rather than one line per byte.
 
-### Stage 3 VHF bridge — implementation committed, target build pending
+### Stage 3 VHF bridge and session lifecycle — hardware-tested
 
-The next source revision adds:
+The VHF bridge was built and installed on the target laptop. The exact 97-byte Game Pad-only descriptor is exposed as a native VHF gamepad (VID 0x1949, PID 0x0402). Input was confirmed in joy.cpl, Terraria, and Dead Cells.
 
-- The exact 97-byte Game Pad-only report descriptor (a byte-for-byte slice of the original 208-byte descriptor).
-- VHF create/start/delete lifecycle paired with the Bluetooth service node's self-managed I/O lifecycle.
-- The required `vhf` lower-filter registration in the profile driver's INF and linkage to `VhfKm.lib`.
-- Validation of the incoming 12-byte `A1 07` HIDP input packet.
-- Forwarding to VHF using Report ID 0x07 and the remaining 11 bytes (including the report-ID byte) through `HID_XFER_PACKET` / `VhfReadReportSubmit`.
+The driver accepts the controller's 12-byte HIDP input packet (prefix A1 07), strips the HIDP header byte, and submits the 11-byte report (Report ID 0x07 plus ten payload bytes) to VHF.
 
-The VHF source revision is committed but has not yet been built or hardware-tested on the target laptop. The next action is a clean Debug | x64 rebuild, package/catalog verification, and then a controlled hardware test. Do not install this revision until that build and package verification succeed.
+The companion Connect utility was tested on the target laptop. It performs one user-requested connection attempt per click; it does not poll or retry in the background. HOME + X is the supported controller mode. HOME-only mode is not part of the supported path.
+
+When the controller is switched off, the disconnect worker stops and drains the Interrupt reader, closes the surviving L2CAP channel, deletes the VHF child, and requests a full Bluetooth ACL disconnect. The user confirmed that Windows Bluetooth Settings changes to Not connected, Steam reports the controller disconnected, and the virtual gamepad disappears from joy.cpl. A later Connect click recreates the session.
+
+## Project status and remaining validation (2026-11-25)
+
+The working prototype is retained on work/l2cap-probe as a known-tested development snapshot. Its local test signature is not a production signature. Microsoft Hardware Developer Program enrollment currently requires organization-level information and authorization, an Entra ID global administrator, and an associated EV certificate; no documented individual machine-only signing route has been identified. The project is paused at this signing gate.
+
+The following have not been validated: operation with Secure Boot enabled and Test Mode disabled; Memory Integrity / HVCI; WHCP/HLK certification; sleep, hibernate, fast startup, and Bluetooth power-transition recovery; and compatibility beyond the single recorded Windows 11 Pro 22H2 target machine.
