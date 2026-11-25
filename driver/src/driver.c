@@ -3,6 +3,8 @@
 #include <bthdef.h>
 #include <bthioctl.h>
 #include <bthddi.h>
+#include <hidclass.h>
+#include <vhf.h>
 
 // Instantiate the Bluetooth profile-interface GUID in this translation unit.
 #include <initguid.h>
@@ -13,6 +15,28 @@
 #define XPMX_INTERRUPT_PSM 0x0013
 #define XPMX_READ_BUFFER_SIZE 672
 #define XPMX_RX_LOG_BYTES 16
+#define XPMX_HIDP_INPUT 0xA1
+#define XPMX_GAMEPAD_REPORT_ID 0x07
+#define XPMX_GAMEPAD_PACKET_LENGTH 12
+#define XPMX_VHF_REPORT_BUFFER_LENGTH 11
+
+// Extracted verbatim as the Game Pad top-level collection from the
+// controller's 208-byte HOME+X SDP report descriptor.
+static UCHAR XpmxGamepadReportDescriptor[] = {
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x07,
+    0x09, 0x01, 0xA1, 0x00, 0x09, 0x30, 0x09, 0x31,
+    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xFF,
+    0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0xC0,
+    0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00,
+    0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95,
+    0x01, 0x81, 0x42, 0x75, 0x04, 0x95, 0x01, 0x81,
+    0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15,
+    0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81,
+    0x02, 0x05, 0x02, 0x15, 0x00, 0x26, 0xFF, 0x00,
+    0x09, 0xC4, 0x09, 0xC5, 0x95, 0x02, 0x75, 0x08,
+    0x81, 0x02, 0x75, 0x08, 0x95, 0x01, 0x81, 0x01,
+    0xC0
+};
 
 typedef struct _DEVICE_CONTEXT DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -47,6 +71,8 @@ struct _DEVICE_CONTEXT {
     CHANNEL_CONTEXT ControlChannel;
     CHANNEL_CONTEXT InterruptChannel;
     INTERRUPT_READER_CONTEXT InterruptReader;
+    VHFHANDLE VhfHandle;
+    BOOLEAN VhfStarted;
     BOOLEAN ProfileInterfaceReady;
     BOOLEAN DeviceInfoReady;
 };
@@ -85,6 +111,80 @@ XpmxLogStatus(
         "[XP-Mx210BL] %s: NTSTATUS=0x%08X\n",
         Operation,
         (ULONG)Status
+        );
+}
+
+static
+NTSTATUS
+XpmxStartVirtualGamepad(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    VHF_CONFIG config;
+
+    if (Context->VhfHandle != NULL) {
+        return STATUS_SUCCESS;
+    }
+
+    VHF_CONFIG_INIT(
+        &config,
+        WdfDeviceWdmGetDeviceObject(Context->Device),
+        (USHORT)sizeof(XpmxGamepadReportDescriptor),
+        XpmxGamepadReportDescriptor
+        );
+
+    // These IDs are taken from the controller's observed SDP/PnP identity.
+    config.VendorID = 0x1949;
+    config.ProductID = 0x0402;
+    config.VhfClientContext = Context;
+
+    status = VhfCreate(&config, &Context->VhfHandle);
+    if (!NT_SUCCESS(status)) {
+        Context->VhfHandle = NULL;
+        XpmxLogStatus("VhfCreate", status);
+        return status;
+    }
+
+    status = VhfStart(Context->VhfHandle);
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("VhfStart", status);
+        VhfDelete(Context->VhfHandle, TRUE);
+        Context->VhfHandle = NULL;
+        return status;
+    }
+
+    Context->VhfStarted = TRUE;
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] VHF gamepad child started: VID=0x1949 PID=0x0402 reportID=0x07 descriptorLength=%Iu\n",
+        sizeof(XpmxGamepadReportDescriptor)
+        );
+
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
+XpmxStopVirtualGamepad(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    if (Context->VhfHandle == NULL) {
+        Context->VhfStarted = FALSE;
+        return;
+    }
+
+    // The Interrupt reader must be stopped before this function is called.
+    VhfDelete(Context->VhfHandle, TRUE);
+    Context->VhfHandle = NULL;
+    Context->VhfStarted = FALSE;
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] VHF gamepad child deleted\n"
         );
 }
 
@@ -687,32 +787,31 @@ XpmxLogInterruptPacket(
     _In_ ULONG RemainingBufferSize
     )
 {
+    static const CHAR hexDigits[] = "0123456789ABCDEF";
+    CHAR hexBuffer[(XPMX_RX_LOG_BYTES * 3) + 1];
     ULONG i;
     ULONG bytesToLog = (Length < XPMX_RX_LOG_BYTES) ?
         Length : XPMX_RX_LOG_BYTES;
-
-    DbgPrintEx(
-        DPFLTR_IHVDRIVER_ID,
-        DPFLTR_INFO_LEVEL,
-        "[XP-Mx210BL] HID Interrupt RX: length=%lu remaining=%lu data=",
-        Length,
-        RemainingBufferSize
-        );
+    ULONG outputOffset = 0;
 
     for (i = 0; i < bytesToLog; ++i) {
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_INFO_LEVEL,
-            "%02X%s",
-            (ULONG)Buffer[i],
-            (i + 1 == bytesToLog) ? "" : " "
-            );
+        if (i != 0) {
+            hexBuffer[outputOffset++] = ' ';
+        }
+
+        hexBuffer[outputOffset++] = hexDigits[(Buffer[i] >> 4) & 0x0F];
+        hexBuffer[outputOffset++] = hexDigits[Buffer[i] & 0x0F];
     }
+
+    hexBuffer[outputOffset] = '\0';
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "\n"
+        "[XP-Mx210BL] HID Interrupt RX: length=%lu remaining=%lu data=%s\n",
+        Length,
+        RemainingBufferSize,
+        hexBuffer
         );
 }
 
@@ -746,6 +845,37 @@ XpmxReadCompletion(
                 bytesRead,
                 reader->Brb.RemainingBufferSize
                 );
+
+            // Bluetooth HIDP DATA/INPUT: 0xA1, followed by the HID report ID.
+            // VHF's HID_XFER_PACKET reportBuffer includes the report ID byte,
+            // while reportId also identifies that same ID.
+            if (bytesRead == XPMX_GAMEPAD_PACKET_LENGTH &&
+                reader->Buffer[0] == XPMX_HIDP_INPUT &&
+                reader->Buffer[1] == XPMX_GAMEPAD_REPORT_ID &&
+                reader->DeviceContext->VhfHandle != NULL &&
+                reader->DeviceContext->VhfStarted) {
+
+                HID_XFER_PACKET transferPacket;
+                NTSTATUS vhfStatus;
+
+                transferPacket.reportId = XPMX_GAMEPAD_REPORT_ID;
+                transferPacket.reportBuffer = reader->Buffer + 1;
+                transferPacket.reportBufferLen = bytesRead - 1;
+
+                vhfStatus = VhfReadReportSubmit(
+                    reader->DeviceContext->VhfHandle,
+                    &transferPacket
+                    );
+
+                if (!NT_SUCCESS(vhfStatus)) {
+                    DbgPrintEx(
+                        DPFLTR_IHVDRIVER_ID,
+                        DPFLTR_WARNING_LEVEL,
+                        "[XP-Mx210BL] VhfReadReportSubmit failed: NTSTATUS=0x%08X\n",
+                        (ULONG)vhfStatus
+                        );
+                }
+            }
         }
 
         if (InterlockedCompareExchange(&reader->Stopping, 0, 0) != 0) {
@@ -964,6 +1094,19 @@ XpmxEvtSelfManagedIoInit(
     XpmxResetChannel(&context->InterruptChannel);
     context->DeviceInfoReady = FALSE;
 
+    // VHF is created and started for each PnP start cycle. This keeps the
+    // virtual HID child lifecycle paired with this Bluetooth service node.
+    status = XpmxStartVirtualGamepad(context);
+    if (!NT_SUCCESS(status)) {
+        // Keep the Bluetooth transport available for diagnostics even if
+        // virtual-HID initialization fails.
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_WARNING_LEVEL,
+            "[XP-Mx210BL] VHF initialization failed; Bluetooth receive probe will continue\n"
+            );
+    }
+
     status = XpmxGetRemoteDeviceInfo(context);
     if (!NT_SUCCESS(status)) {
         // Keep the PnP node started so diagnostics remain available.
@@ -1002,8 +1145,11 @@ XpmxEvtSelfManagedIoCleanup(
 {
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
 
-    // Stop and drain the pending read before closing the channel.
+    // Stop and drain the pending read before deleting VHF or closing channels.
     XpmxStopInterruptReader(context);
+
+    // VhfDelete must not race with a new VhfReadReportSubmit call.
+    XpmxStopVirtualGamepad(context);
 
     // Close in reverse-open order. Handles are invalidated by the channel
     // callback as soon as a remote disconnect is observed.
