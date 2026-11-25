@@ -84,7 +84,11 @@ The driver performs one connection attempt on PnP start. After a controller-side
 
 1. Leave laptop Bluetooth enabled.
 2. Turn the controller on in HOME+X mode.
-3. Run tools/XpMx210BL-Connect.ps1. It requests elevation automatically.
+3. From the repository root, launch the companion window:
+   ~~~powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\XpMx210BL-Connect.ps1
+   ~~~
+   It requests elevation automatically if the current PowerShell session is not elevated.
 4. Click **Connect** once.
 5. A successful request should display a success message and DebugView should show:
    ~~~text
