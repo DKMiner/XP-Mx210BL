@@ -39,7 +39,10 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
-    <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+      <SignMode>TestSign</SignMode>
+    </DriverSign>
     <Link>
       <AdditionalDependencies>$(DDK_LIB_PATH)vhfkm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
