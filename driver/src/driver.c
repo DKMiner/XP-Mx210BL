@@ -11,18 +11,45 @@
 #define XPMX_POOL_TAG 'xMpX'
 #define XPMX_CONTROL_PSM 0x0011
 #define XPMX_INTERRUPT_PSM 0x0013
+#define XPMX_READ_BUFFER_SIZE 672
+#define XPMX_RX_LOG_BYTES 16
 
-typedef struct _DEVICE_CONTEXT {
+typedef struct _DEVICE_CONTEXT DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+
+typedef struct _CHANNEL_CONTEXT {
+    PDEVICE_CONTEXT DeviceContext;
+    USHORT Psm;
+    PCSTR Name;
+    HANDLE Handle;
+    KSPIN_LOCK Lock;
+    volatile LONG Disconnected;
+} CHANNEL_CONTEXT, *PCHANNEL_CONTEXT;
+
+typedef struct _INTERRUPT_READER_CONTEXT {
+    PDEVICE_CONTEXT DeviceContext;
+    WDFREQUEST Request;
+    WDFMEMORY BufferMemory;
+    WDFMEMORY BrbMemory;
+    struct _BRB_L2CA_ACL_TRANSFER Brb;
+    PUCHAR Buffer;
+    KDPC ResubmitDpc;
+    KEVENT StopEvent;
+    volatile LONG Stopping;
+    volatile LONG Running;
+    volatile LONG Initialized;
+} INTERRUPT_READER_CONTEXT, *PINTERRUPT_READER_CONTEXT;
+
+struct _DEVICE_CONTEXT {
     WDFDEVICE Device;
     WDFIOTARGET IoTarget;
     BTH_PROFILE_DRIVER_INTERFACE ProfileInterface;
     BTH_DEVICE_INFO RemoteDeviceInfo;
-    HANDLE ControlChannel;
-    HANDLE InterruptChannel;
+    CHANNEL_CONTEXT ControlChannel;
+    CHANNEL_CONTEXT InterruptChannel;
+    INTERRUPT_READER_CONTEXT InterruptReader;
     BOOLEAN ProfileInterfaceReady;
     BOOLEAN DeviceInfoReady;
-    volatile LONG RemoteDisconnected;
-} DEVICE_CONTEXT, *PDEVICE_CONTEXT;
+};
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
@@ -30,6 +57,20 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD XpmxEvtDeviceAdd;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT XpmxEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP XpmxEvtSelfManagedIoCleanup;
+
+static VOID XpmxReadCompletion(
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
+    _In_ WDFCONTEXT Context
+    );
+
+static VOID XpmxReadResubmitDpc(
+    _In_ struct _KDPC *Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    );
 
 static
 VOID
@@ -45,6 +86,55 @@ XpmxLogStatus(
         Operation,
         (ULONG)Status
         );
+}
+
+static
+HANDLE
+XpmxGetChannelHandle(
+    _Inout_ PCHANNEL_CONTEXT Channel
+    )
+{
+    KIRQL oldIrql;
+    HANDLE handle;
+
+    KeAcquireSpinLock(&Channel->Lock, &oldIrql);
+    handle = Channel->Handle;
+    KeReleaseSpinLock(&Channel->Lock, oldIrql);
+
+    return handle;
+}
+
+static
+VOID
+XpmxResetChannel(
+    _Inout_ PCHANNEL_CONTEXT Channel
+    )
+{
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&Channel->Lock, &oldIrql);
+    Channel->Handle = NULL;
+    InterlockedExchange(&Channel->Disconnected, 0);
+    KeReleaseSpinLock(&Channel->Lock, oldIrql);
+}
+
+static
+VOID
+XpmxRequestStopInterruptReader(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+
+    if (InterlockedCompareExchange(&reader->Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    InterlockedExchange(&reader->Stopping, 1);
+
+    if (reader->Request != NULL) {
+        (VOID)WdfRequestCancelSentRequest(reader->Request);
+    }
 }
 
 static
@@ -178,9 +268,8 @@ XpmxL2capIndicationCallback(
     _In_ PINDICATION_PARAMETERS Parameters
     )
 {
-    PDEVICE_CONTEXT context = (PDEVICE_CONTEXT)CallbackContext;
-
-    UNREFERENCED_PARAMETER(Parameters);
+    PCHANNEL_CONTEXT channel = (PCHANNEL_CONTEXT)CallbackContext;
+    PDEVICE_CONTEXT context = channel->DeviceContext;
 
     switch (Indication) {
     case IndicationAddReference:
@@ -188,13 +277,38 @@ XpmxL2capIndicationCallback(
         break;
 
     case IndicationRemoteDisconnect:
-        InterlockedExchange(&context->RemoteDisconnected, 1);
+    {
+        KIRQL oldIrql;
+        HANDLE disconnectedHandle = Parameters->ConnectionHandle;
+        BOOLEAN matched;
+
+        KeAcquireSpinLock(&channel->Lock, &oldIrql);
+
+        matched = (channel->Handle == NULL ||
+                   channel->Handle == disconnectedHandle);
+
+        if (matched) {
+            channel->Handle = NULL;
+            InterlockedExchange(&channel->Disconnected, 1);
+        }
+
+        KeReleaseSpinLock(&channel->Lock, oldIrql);
+
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
-            "[XP-Mx210BL] Remote L2CAP disconnect indication received\n"
+            "[XP-Mx210BL] %s remote disconnect: reason=%u handle=%p matched=%u\n",
+            channel->Name,
+            (ULONG)Parameters->Parameters.Disconnect.Reason,
+            disconnectedHandle,
+            matched ? 1u : 0u
             );
+
+        if (matched && channel->Psm == XPMX_INTERRUPT_PSM) {
+            XpmxRequestStopInterruptReader(context);
+        }
         break;
+    }
 
     case IndicationRemoteConnect:
     case IndicationRemoteConfigRequest:
@@ -209,15 +323,13 @@ static
 NTSTATUS
 XpmxOpenL2capChannel(
     _Inout_ PDEVICE_CONTEXT Context,
-    _In_ USHORT Psm,
-    _Out_ PHANDLE ChannelHandle,
-    _In_z_ PCSTR ChannelName
+    _Inout_ PCHANNEL_CONTEXT Channel
     )
 {
     NTSTATUS status;
     struct _BRB_L2CA_OPEN_CHANNEL* brb;
-
-    *ChannelHandle = NULL;
+    KIRQL oldIrql;
+    BOOLEAN disconnectedDuringOpen;
 
     brb = (struct _BRB_L2CA_OPEN_CHANNEL*)Context->ProfileInterface.BthAllocateBrb(
         BRB_L2CA_OPEN_CHANNEL,
@@ -232,7 +344,7 @@ XpmxOpenL2capChannel(
     Context->ProfileInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_OPEN_CHANNEL);
 
     brb->BtAddress = Context->RemoteDeviceInfo.address;
-    brb->Psm = Psm;
+    brb->Psm = Channel->Psm;
     brb->ChannelFlags = CF_ROLE_EITHER;
 
     brb->ConfigOut.Flags = CFG_MTU;
@@ -247,7 +359,7 @@ XpmxOpenL2capChannel(
 
     brb->CallbackFlags = CALLBACK_DISCONNECT;
     brb->Callback = XpmxL2capIndicationCallback;
-    brb->CallbackContext = Context;
+    brb->CallbackContext = Channel;
     brb->ReferenceObject = (PVOID)WdfDeviceWdmGetDeviceObject(Context->Device);
     brb->IncomingQueueDepth = 10;
 
@@ -258,24 +370,44 @@ XpmxOpenL2capChannel(
         );
 
     if (NT_SUCCESS(status)) {
-        *ChannelHandle = brb->ChannelHandle;
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_INFO_LEVEL,
-            "[XP-Mx210BL] %s opened: PSM=0x%04X handle=%p outMTU=%u inMTU=%u\n",
-            ChannelName,
-            Psm,
-            brb->ChannelHandle,
-            brb->OutResults.Params.Mtu,
-            brb->InResults.Params.Mtu
-            );
+        KeAcquireSpinLock(&Channel->Lock, &oldIrql);
+
+        disconnectedDuringOpen =
+            (InterlockedCompareExchange(&Channel->Disconnected, 0, 0) != 0);
+
+        if (!disconnectedDuringOpen) {
+            Channel->Handle = brb->ChannelHandle;
+        }
+
+        KeReleaseSpinLock(&Channel->Lock, oldIrql);
+
+        if (disconnectedDuringOpen) {
+            status = STATUS_DEVICE_NOT_CONNECTED;
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[XP-Mx210BL] %s disconnected while its open request was completing\n",
+                Channel->Name
+                );
+        } else {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_INFO_LEVEL,
+                "[XP-Mx210BL] %s opened: PSM=0x%04X handle=%p outMTU=%u inMTU=%u\n",
+                Channel->Name,
+                Channel->Psm,
+                brb->ChannelHandle,
+                brb->OutResults.Params.Mtu,
+                brb->InResults.Params.Mtu
+                );
+        }
     } else {
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_ERROR_LEVEL,
             "[XP-Mx210BL] %s failed: PSM=0x%04X NTSTATUS=0x%08X BRB_STATUS=0x%08X BTH_STATUS=0x%08X\n",
-            ChannelName,
-            Psm,
+            Channel->Name,
+            Channel->Psm,
             (ULONG)status,
             (ULONG)brb->Hdr.Status,
             (ULONG)brb->Hdr.BtStatus
@@ -290,15 +422,19 @@ static
 VOID
 XpmxCloseL2capChannel(
     _Inout_ PDEVICE_CONTEXT Context,
-    _Inout_ PHANDLE ChannelHandle,
-    _In_z_ PCSTR ChannelName
+    _Inout_ PCHANNEL_CONTEXT Channel
     )
 {
     NTSTATUS status;
+    HANDLE handle;
     struct _BRB_L2CA_CLOSE_CHANNEL* brb;
 
-    if (*ChannelHandle == NULL || !Context->ProfileInterfaceReady ||
-        !Context->DeviceInfoReady) {
+    if (!Context->ProfileInterfaceReady || !Context->DeviceInfoReady) {
+        return;
+    }
+
+    handle = XpmxGetChannelHandle(Channel);
+    if (handle == NULL) {
         return;
     }
 
@@ -309,14 +445,13 @@ XpmxCloseL2capChannel(
 
     if (brb == NULL) {
         XpmxLogStatus("BthAllocateBrb(CLOSE_CHANNEL)", STATUS_INSUFFICIENT_RESOURCES);
-        *ChannelHandle = NULL;
         return;
     }
 
     Context->ProfileInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_CLOSE_CHANNEL);
 
     brb->BtAddress = Context->RemoteDeviceInfo.address;
-    brb->ChannelHandle = *ChannelHandle;
+    brb->ChannelHandle = handle;
 
     status = XpmxSendBrbSynchronously(
         Context,
@@ -329,21 +464,420 @@ XpmxCloseL2capChannel(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
             "[XP-Mx210BL] %s closed: handle=%p\n",
-            ChannelName,
-            *ChannelHandle
+            Channel->Name,
+            handle
             );
     } else {
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
             "[XP-Mx210BL] %s close failed: NTSTATUS=0x%08X\n",
-            ChannelName,
+            Channel->Name,
             (ULONG)status
             );
     }
 
     Context->ProfileInterface.BthFreeBrb((PBRB)brb);
-    *ChannelHandle = NULL;
+
+    {
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&Channel->Lock, &oldIrql);
+
+        if (Channel->Handle == handle) {
+            Channel->Handle = NULL;
+            InterlockedExchange(&Channel->Disconnected, 1);
+        }
+
+        KeReleaseSpinLock(&Channel->Lock, oldIrql);
+    }
+}
+
+static
+NTSTATUS
+XpmxInitializeInterruptReader(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+    size_t bufferSize;
+
+    RtlZeroMemory(reader, sizeof(*reader));
+    reader->DeviceContext = Context;
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Context->Device;
+
+    status = WdfRequestCreate(
+        &attributes,
+        Context->IoTarget,
+        &reader->Request
+        );
+
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfRequestCreate(InterruptRead)", status);
+        return status;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = reader->Request;
+
+    status = WdfMemoryCreate(
+        &attributes,
+        NonPagedPoolNx,
+        XPMX_POOL_TAG,
+        XPMX_READ_BUFFER_SIZE,
+        &reader->BufferMemory,
+        NULL
+        );
+
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfMemoryCreate(InterruptReadBuffer)", status);
+        WdfObjectDelete(reader->Request);
+        reader->Request = NULL;
+        return status;
+    }
+
+    reader->Buffer = (PUCHAR)WdfMemoryGetBuffer(
+        reader->BufferMemory,
+        &bufferSize
+        );
+
+    if (reader->Buffer == NULL || bufferSize < XPMX_READ_BUFFER_SIZE) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        XpmxLogStatus("WdfMemoryGetBuffer(InterruptRead)", status);
+        WdfObjectDelete(reader->Request);
+        reader->Request = NULL;
+        return status;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = reader->Request;
+
+    status = WdfMemoryCreatePreallocated(
+        &attributes,
+        &reader->Brb,
+        sizeof(reader->Brb),
+        &reader->BrbMemory
+        );
+
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfMemoryCreatePreallocated(InterruptReadBRB)", status);
+        WdfObjectDelete(reader->Request);
+        reader->Request = NULL;
+        return status;
+    }
+
+    KeInitializeDpc(
+        &reader->ResubmitDpc,
+        XpmxReadResubmitDpc,
+        Context
+        );
+
+    KeInitializeEvent(&reader->StopEvent, NotificationEvent, TRUE);
+    InterlockedExchange(&reader->Stopping, 0);
+    InterlockedExchange(&reader->Running, 0);
+    InterlockedExchange(&reader->Initialized, 1);
+
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+XpmxSubmitInterruptRead(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    WDF_REQUEST_REUSE_PARAMS reuseParams;
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+    HANDLE channelHandle;
+
+    if (InterlockedCompareExchange(&reader->Stopping, 0, 0) != 0) {
+        InterlockedExchange(&reader->Running, 0);
+        KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+        return STATUS_CANCELLED;
+    }
+
+    channelHandle = XpmxGetChannelHandle(&Context->InterruptChannel);
+    if (channelHandle == NULL) {
+        status = STATUS_DEVICE_NOT_CONNECTED;
+        goto failed;
+    }
+
+    Context->ProfileInterface.BthReuseBrb(
+        (PBRB)&reader->Brb,
+        BRB_L2CA_ACL_TRANSFER
+        );
+
+    WDF_REQUEST_REUSE_PARAMS_INIT(
+        &reuseParams,
+        WDF_REQUEST_REUSE_NO_FLAGS,
+        STATUS_UNSUCCESSFUL
+        );
+
+    status = WdfRequestReuse(reader->Request, &reuseParams);
+    if (!NT_SUCCESS(status)) {
+        goto failed;
+    }
+
+    reader->Brb.BtAddress = Context->RemoteDeviceInfo.address;
+    reader->Brb.ChannelHandle = channelHandle;
+    reader->Brb.TransferFlags =
+        ACL_TRANSFER_DIRECTION_IN | ACL_SHORT_TRANSFER_OK;
+    reader->Brb.BufferSize = XPMX_READ_BUFFER_SIZE;
+    reader->Brb.Buffer = reader->Buffer;
+    reader->Brb.BufferMDL = NULL;
+    reader->Brb.Timeout = 0;
+    reader->Brb.RemainingBufferSize = 0;
+
+    status = WdfIoTargetFormatRequestForInternalIoctlOthers(
+        Context->IoTarget,
+        reader->Request,
+        IOCTL_INTERNAL_BTH_SUBMIT_BRB,
+        reader->BrbMemory,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+        );
+
+    if (!NT_SUCCESS(status)) {
+        goto failed;
+    }
+
+    WdfRequestSetCompletionRoutine(
+        reader->Request,
+        XpmxReadCompletion,
+        reader
+        );
+
+    if (!WdfRequestSend(reader->Request, Context->IoTarget, NULL)) {
+        status = WdfRequestGetStatus(reader->Request);
+        goto failed;
+    }
+
+    return STATUS_SUCCESS;
+
+failed:
+    if (InterlockedCompareExchange(&reader->Stopping, 0, 0) == 0) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_ERROR_LEVEL,
+            "[XP-Mx210BL] Interrupt read submission failed: NTSTATUS=0x%08X\n",
+            (ULONG)status
+            );
+    }
+
+    InterlockedExchange(&reader->Running, 0);
+    KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+    return status;
+}
+
+static
+VOID
+XpmxLogInterruptPacket(
+    _In_reads_bytes_(Length) const UCHAR* Buffer,
+    _In_ ULONG Length,
+    _In_ ULONG RemainingBufferSize
+    )
+{
+    ULONG i;
+    ULONG bytesToLog = min(Length, XPMX_RX_LOG_BYTES);
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] HID Interrupt RX: length=%lu remaining=%lu data=",
+        Length,
+        RemainingBufferSize
+        );
+
+    for (i = 0; i < bytesToLog; ++i) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "%02X%s",
+            Buffer[i],
+            (i + 1 == bytesToLog) ? "" : " "
+            );
+    }
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "\n"
+        );
+}
+
+static
+VOID
+XpmxReadCompletion(
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
+    _In_ WDFCONTEXT CompletionContext
+    )
+{
+    PINTERRUPT_READER_CONTEXT reader =
+        (PINTERRUPT_READER_CONTEXT)CompletionContext;
+    NTSTATUS status = Params->IoStatus.Status;
+    ULONG bytesRead;
+
+    UNREFERENCED_PARAMETER(Request);
+    UNREFERENCED_PARAMETER(Target);
+
+    if (NT_SUCCESS(status)) {
+        bytesRead = reader->Brb.BufferSize;
+
+        if (bytesRead > XPMX_READ_BUFFER_SIZE) {
+            bytesRead = XPMX_READ_BUFFER_SIZE;
+        }
+
+        if (bytesRead != 0) {
+            XpmxLogInterruptPacket(
+                reader->Buffer,
+                bytesRead,
+                reader->Brb.RemainingBufferSize
+                );
+        }
+
+        if (InterlockedCompareExchange(&reader->Stopping, 0, 0) != 0) {
+            InterlockedExchange(&reader->Running, 0);
+            KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+            return;
+        }
+
+        if (!KeInsertQueueDpc(&reader->ResubmitDpc, NULL, NULL)) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_ERROR_LEVEL,
+                "[XP-Mx210BL] Could not queue Interrupt read resubmit DPC\n"
+                );
+            InterlockedExchange(&reader->Running, 0);
+            KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+        }
+    } else {
+        if (status != STATUS_CANCELLED &&
+            InterlockedCompareExchange(&reader->Stopping, 0, 0) == 0) {
+            DbgPrintEx(
+                DPFLTR_IHVDRIVER_ID,
+                DPFLTR_WARNING_LEVEL,
+                "[XP-Mx210BL] Interrupt read completed: NTSTATUS=0x%08X\n",
+                (ULONG)status
+                );
+        }
+
+        InterlockedExchange(&reader->Running, 0);
+        KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+static
+VOID
+XpmxReadResubmitDpc(
+    _In_ struct _KDPC *Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2
+    )
+{
+    PDEVICE_CONTEXT context = (PDEVICE_CONTEXT)DeferredContext;
+    PINTERRUPT_READER_CONTEXT reader = &context->InterruptReader;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    if (InterlockedCompareExchange(&reader->Stopping, 0, 0) != 0) {
+        InterlockedExchange(&reader->Running, 0);
+        KeSetEvent(&reader->StopEvent, IO_NO_INCREMENT, FALSE);
+        return;
+    }
+
+    (VOID)XpmxSubmitInterruptRead(context);
+}
+
+static
+NTSTATUS
+XpmxStartInterruptReader(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+
+    status = XpmxInitializeInterruptReader(Context);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    InterlockedExchange(&reader->Stopping, 0);
+    InterlockedExchange(&reader->Running, 1);
+    KeClearEvent(&reader->StopEvent);
+
+    status = XpmxSubmitInterruptRead(Context);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] Continuous HID Interrupt reader started\n"
+        );
+
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
+XpmxStopInterruptReader(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+
+    if (InterlockedCompareExchange(&reader->Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    InterlockedExchange(&reader->Stopping, 1);
+
+    if (reader->Request != NULL) {
+        (VOID)WdfRequestCancelSentRequest(reader->Request);
+    }
+
+    if (InterlockedCompareExchange(&reader->Running, 0, 0) != 0) {
+        KeWaitForSingleObject(
+            &reader->StopEvent,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL
+            );
+    }
+}
+
+static
+VOID
+XpmxUninitializeInterruptReader(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+
+    if (InterlockedCompareExchange(&reader->Initialized, 0, 0) == 0) {
+        return;
+    }
+
+    if (reader->Request != NULL) {
+        WdfObjectDelete(reader->Request);
+    }
+
+    RtlZeroMemory(reader, sizeof(*reader));
 }
 
 NTSTATUS
@@ -379,6 +913,16 @@ XpmxEvtDeviceAdd(
     context->Device = device;
     context->IoTarget = WdfDeviceGetIoTarget(device);
 
+    context->ControlChannel.DeviceContext = context;
+    context->ControlChannel.Psm = XPMX_CONTROL_PSM;
+    context->ControlChannel.Name = "HID Control";
+    KeInitializeSpinLock(&context->ControlChannel.Lock);
+
+    context->InterruptChannel.DeviceContext = context;
+    context->InterruptChannel.Psm = XPMX_INTERRUPT_PSM;
+    context->InterruptChannel.Name = "HID Interrupt";
+    KeInitializeSpinLock(&context->InterruptChannel.Lock);
+
     status = WdfFdoQueryForInterface(
         device,
         &GUID_BTHDDI_PROFILE_DRIVER_INTERFACE,
@@ -412,38 +956,24 @@ XpmxEvtSelfManagedIoInit(
     NTSTATUS status;
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
 
-    InterlockedExchange(&context->RemoteDisconnected, 0);
+    XpmxResetChannel(&context->ControlChannel);
+    XpmxResetChannel(&context->InterruptChannel);
     context->DeviceInfoReady = FALSE;
-    context->ControlChannel = NULL;
-    context->InterruptChannel = NULL;
 
     status = XpmxGetRemoteDeviceInfo(context);
     if (!NT_SUCCESS(status)) {
         // Keep the PnP node started so diagnostics remain available.
-        // A device restart with the controller awake can retry the probe.
         return STATUS_SUCCESS;
     }
 
-    status = XpmxOpenL2capChannel(
-        context,
-        XPMX_CONTROL_PSM,
-        &context->ControlChannel,
-        "HID Control"
-        );
-
+    status = XpmxOpenL2capChannel(context, &context->ControlChannel);
     if (!NT_SUCCESS(status)) {
         return STATUS_SUCCESS;
     }
 
-    status = XpmxOpenL2capChannel(
-        context,
-        XPMX_INTERRUPT_PSM,
-        &context->InterruptChannel,
-        "HID Interrupt"
-        );
-
+    status = XpmxOpenL2capChannel(context, &context->InterruptChannel);
     if (!NT_SUCCESS(status)) {
-        XpmxCloseL2capChannel(context, &context->ControlChannel, "HID Control");
+        XpmxCloseL2capChannel(context, &context->ControlChannel);
         return STATUS_SUCCESS;
     }
 
@@ -452,6 +982,11 @@ XpmxEvtSelfManagedIoInit(
         DPFLTR_INFO_LEVEL,
         "[XP-Mx210BL] Both HID L2CAP channels are open. Probe milestone passed.\n"
         );
+
+    status = XpmxStartInterruptReader(context);
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("Start continuous HID Interrupt reader", status);
+    }
 
     return STATUS_SUCCESS;
 }
@@ -463,9 +998,17 @@ XpmxEvtSelfManagedIoCleanup(
 {
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
 
-    // Close in reverse-open order.
-    XpmxCloseL2capChannel(context, &context->InterruptChannel, "HID Interrupt");
-    XpmxCloseL2capChannel(context, &context->ControlChannel, "HID Control");
+    // Stop and drain the pending read before closing the channel.
+    XpmxStopInterruptReader(context);
+
+    // Close in reverse-open order. Handles are invalidated by the channel
+    // callback as soon as a remote disconnect is observed.
+    XpmxCloseL2capChannel(context, &context->InterruptChannel);
+    XpmxCloseL2capChannel(context, &context->ControlChannel);
+
+    // Keep the request alive until both channel-close operations have
+    // completed, so a late disconnect callback cannot touch a deleted request.
+    XpmxUninitializeInterruptReader(context);
 }
 
 NTSTATUS
