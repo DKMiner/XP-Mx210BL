@@ -11,7 +11,7 @@
 
 ### Provenance
 
-Extracted from the Android Bluetooth HCI snoop capture `btsnoop_hci.log.last` in the investigation source files. The SDP exchange was isolated to the classic Bluetooth connection for the controller address `00:90:E1:5C:17:C2`, then the SDP ServiceAttributeResponse fragments were reassembled. The report descriptor was taken from HIDDescriptorList attribute `0x0206`, descriptor type `0x22`. The file is the exact 208-byte descriptor transmitted by the controller; it was not manually reconstructed.
+Extracted from the Android Bluetooth HCI snoop capture `btsnoop_hci.log.last` in the investigation source files. The SDP exchange was isolated to the classic Bluetooth connection for the controller address `the XP-Mx210BL controller`, then the SDP ServiceAttributeResponse fragments were reassembled. The report descriptor was taken from HIDDescriptorList attribute `0x0206`, descriptor type `0x22`. The file is the exact 208-byte descriptor transmitted by the controller; it was not manually reconstructed.
 
 ### Application collections and report IDs
 
