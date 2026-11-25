@@ -8,7 +8,7 @@ $principal = New-Object Security.Principal.WindowsPrincipal(
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath = '"' + $PSCommandPath.Replace('"', '\"') + '"'
-    Start-Process -FilePath $powershell -Verb RunAs -ArgumentList @(
+    Start-Process -FilePath $powershell -Verb RunAs -WindowStyle Hidden -ArgumentList @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $scriptPath
     )
     exit
