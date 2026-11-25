@@ -704,7 +704,7 @@ XpmxLogInterruptPacket(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
             "%02X%s",
-            Buffer[i],
+            (ULONG)Buffer[i],
             (i + 1 == bytesToLog) ? "" : " "
             );
     }
