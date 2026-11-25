@@ -179,5 +179,23 @@ public static class XpmxConnectApp
 }
 '@
 
-Add-Type -TypeDefinition $source -Language CSharp
+# Add-Type does not automatically reference assemblies merely because they
+# have been loaded into the PowerShell session. Pass the actual framework
+# assembly paths so the C# compiler can resolve WinForms and Drawing types.
+$frameworkReferences = @(
+    [System.Object].Assembly.Location,
+    [System.ComponentModel.Component].Assembly.Location,
+    [System.Threading.Tasks.Task].Assembly.Location,
+    [System.Drawing.Font].Assembly.Location,
+    [System.Windows.Forms.Form].Assembly.Location
+) | Where-Object { $_ } | Select-Object -Unique
+
+try {
+    Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies $frameworkReferences -ErrorAction Stop
+}
+catch {
+    Write-Error ("Could not compile the XP-Mx210BL Connect helper: " + $_.Exception.Message)
+    throw
+}
+
 [XpmxConnectApp]::Run()
