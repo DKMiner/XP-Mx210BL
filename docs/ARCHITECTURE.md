@@ -8,25 +8,25 @@ No Android bridge, no iCade keyboard mapping, no permanently attached USB Blueto
 
 ## Device binding
 
-Windows' Bluetooth enumerator creates a PnP node for each remote service. Microsoft documents these hardware-ID patterns:
-
-- BTHENUM\{ServiceGUID}_VID&...
-- BTHENUM\{ServiceGUID}_VID&..._PID&...
-- compatible ID BTHENUM\{ServiceGUID}
+Windows' Bluetooth enumerator creates a PnP node for each remote service. Microsoft's Bluetooth INF model supports hardware IDs formed from the remote service UUID and VID/PID.
 
 The HID service GUID is:
 
+```text
 00001124-0000-1000-8000-00805F9B34FB
+```
 
 The controller's observed node contains:
 
+```text
 BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
+```
 
 The intended INF match is this specific service + VID + PID hardware ID. The purpose is to outrank the generic inbox HID Bluetooth profile match for this controller only.
 
 Do not match the generic BTHENUM HID compatible ID unless deliberately testing broadly. Do not bind to or replace the Intel Bluetooth radio driver.
 
-## Transport layer
+## Bluetooth transport layer
 
 The profile driver attaches to the controller's HID service PDO. It obtains the Bluetooth profile-driver interface (GUID_BTHDDI_PROFILE_DRIVER_INTERFACE) and uses the default I/O target to send IOCTL_INTERNAL_BTH_SUBMIT_BRB requests to BthPort.sys.
 
@@ -36,30 +36,45 @@ Connection sequence:
 2. Retrieve the remote Bluetooth address using IOCTL_INTERNAL_BTHENUM_GET_DEVINFO.
 3. Open HID Control L2CAP PSM 0x0011 with BRB_L2CA_OPEN_CHANNEL.
 4. Open HID Interrupt L2CAP PSM 0x0013 with BRB_L2CA_OPEN_CHANNEL.
-5. Start a pending inbound BRB_L2CA_ACL_TRANSFER request on the Interrupt channel. After each successful read, the completion routine queues a DPC that re-submits the read.
-6. Log the transferred length, remaining buffer size, and first 16 bytes of each received Interrupt-channel transfer.
+5. Start a pending inbound BRB_L2CA_ACL_TRANSFER request on the Interrupt channel.
+6. After each successful read, the completion routine queues a DPC that re-submits the read.
 
-The profile callback is channel-specific. When a remote disconnect is indicated, it invalidates only the matching channel handle, sets the CloseNow response so the Bluetooth stack can finish tearing down that channel, and cancels the continuous Interrupt read when appropriate. PnP cleanup stops and drains the read before closing still-valid channels.
+The profile callback is channel-specific. When a remote disconnect is indicated, it invalidates only the affected channel handle, sets the CloseNow response so the Bluetooth stack can finish tearing down that channel, and cancels the pending Interrupt read when appropriate. PnP cleanup stops and drains the read before closing still-valid channels.
 
-The driver currently does not autonomously reopen channels after a remote disconnect while the service node remains started. Restarting this specific PnP device re-runs the open sequence. Automatic reconnect and power-transition recovery are separate work items.
+The driver does not yet autonomously reopen channels after a remote disconnect while the service node remains started. Restarting this specific PnP device re-runs the open sequence. Automatic reconnect and power-transition recovery are separate work items.
 
-The controller's captured SDP record indicates fixed PSMs; a new SDP query is not necessary for this first probe. Basic L2CAP mode is used initially, with the observed 672-byte MTU and an incoming queue depth of 10.
+The controller's captured SDP record indicates fixed PSMs; a new SDP query is not necessary for this implementation. Basic L2CAP mode is used, with the observed 672-byte MTU and an incoming queue depth of 10.
 
-## HIDP and virtual HID
+## HIDP input receive
 
-The current receive stage only records raw Interrupt-channel bytes. It does not implement the HIDP state machine.
+The Android HOME+X SDP record contains a 208-byte HID Report Descriptor with three top-level collections: Consumer Control (report ID 0x02), Mouse (0x06), and Game Pad (0x07).
 
-Next steps after validating the received reports:
+The controller's Interrupt channel sends 12-byte gamepad packets:
 
-1. Capture complete input report payloads and compare them with the Android btsnoop trace.
-2. Implement the required HIDP control-channel transactions and report handling.
-3. Validate report IDs, lengths, and the captured 208-byte report descriptor.
-4. Preserve the original descriptor and report bytes as protocol fixtures.
-5. Submit validated gamepad input reports through a VHF-backed HID source device.
+- Byte 0: HIDP DATA/INPUT header 0xA1.
+- Byte 1: Report ID 0x07.
+- Bytes 2–11: the ten-byte Game Pad report payload.
 
-VHF is a separate logical HID device stack. The Bluetooth profile driver can be the report source, but it must submit the descriptor and input reports through the documented VHF API rather than pretending raw L2CAP packets are already Windows HID reports.
+The Game Pad payload fields, as declared by the descriptor, are four 8-bit axes (X, Y, Z, Rz), a 4-bit hat plus constant padding, a 16-bit button field, 8-bit Accelerator and Brake values, and constant padding. Exact descriptor bytes and the packet layout are preserved in protocol/.
 
-The final virtual gamepad should expose the captured gamepad collection, not the mouse or Consumer Control collection unless later desired.
+The Stage 2 capture contained 229 valid-length packets with prefix A1 07 and 150 distinct byte patterns while the controls were exercised. This establishes that the custom Windows driver receives changing gamepad reports from the controller.
+
+## VHF virtual gamepad
+
+The profile driver now has a Stage 3 VHF source-device path:
+
+1. During EvtDeviceSelfManagedIoInit, initialize VHF_CONFIG with the source device object and the 97-byte Game Pad-only report descriptor.
+2. Call VhfCreate and VhfStart to create and start the virtual HID child.
+3. For each 12-byte Interrupt packet, accept only HIDP DATA/INPUT (0xA1) with Report ID 0x07.
+4. Strip the HIDP packet header byte 0xA1. Submit the remaining 11 bytes (Report ID 0x07 plus ten payload bytes) through HID_XFER_PACKET and VhfReadReportSubmit.
+5. Use VHF's default input-report buffering. No EvtVhfReadyForNextReadReport callback is registered, so the receive buffer can be reused after VhfReadReportSubmit returns.
+6. During EvtDeviceSelfManagedIoCleanup, stop/drain the Interrupt reader before calling VhfDelete synchronously.
+
+The 97-byte VHF descriptor is a byte-for-byte slice of the Game Pad top-level Application Collection from the original 208-byte descriptor. The Consumer Control and Mouse collections are intentionally omitted so the virtual child exposes only a gamepad.
+
+The INF registers VHF as a lower filter for the Bluetooth profile source device, and the project links VhfKm.lib. The Stage 3 VHF revision is committed but has not yet been built or hardware-tested on the target laptop.
+
+No HIDP Control-channel SET_PROTOCOL/GET_REPORT/SET_REPORT transactions or HID output/rumble reports are implemented yet. The present goal is a read-only virtual gamepad.
 
 ## Why not patch hidbth.sys?
 
@@ -76,6 +91,4 @@ Patching a Microsoft inbox binary would be fragile, difficult to maintain, and w
 
 ## Setup class and virtual HID separation
 
-The INF intentionally uses the Windows Bluetooth setup class, following Microsoft's Bluetooth profile-driver installation model. The current inbox HidBth package classifies its device node as HIDClass because it is itself a HID transport driver; this prototype instead owns the Bluetooth profile service and does not expose raw HID transport callbacks on that PDO. The gamepad that applications consume will be a separate virtual HID child created through VHF, where the HID class stack is appropriate.
-
-The targeted match remains the remote HID service UUID plus VID 1949 / PID 0402.
+The INF intentionally uses the Windows Bluetooth setup class, following Microsoft's Bluetooth profile-driver installation model. The current inbox HidBth package classifies its device node as HIDClass because it is itself a HID transport driver; this prototype instead owns the Bluetooth profile service and does not expose raw HID transport callbacks on that PDO. The gamepad applications consume is a separate VHF-created HID child, with the HID class stack above VHF.
