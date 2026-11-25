@@ -3,7 +3,7 @@
 #include <bthdef.h>
 #include <bthioctl.h>
 #include <bthddi.h>
-#include <hidclass.h>
+#include <hidport.h>
 #include <vhf.h>
 
 // Instantiate the Bluetooth profile-interface GUID in this translation unit.
