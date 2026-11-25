@@ -1115,15 +1115,13 @@ XpmxDisconnectRemoteDevice(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
-            "[XP-Mx210BL] Bluetooth ACL was already disconnected
-"
+            "[XP-Mx210BL] Bluetooth ACL was already disconnected\n"
             );
     } else if (NT_SUCCESS(status)) {
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
-            "[XP-Mx210BL] Requested full Bluetooth device disconnect
-"
+            "[XP-Mx210BL] Requested full Bluetooth device disconnect\n"
             );
     } else {
         XpmxLogStatus("IOCTL_BTH_DISCONNECT_DEVICE", status);
@@ -1160,8 +1158,7 @@ XpmxEvtDisconnectWorkItem(
                 DbgPrintEx(
                     DPFLTR_IHVDRIVER_ID,
                     DPFLTR_WARNING_LEVEL,
-                    "[XP-Mx210BL] HID channel lost; tearing down the complete session
-"
+                    "[XP-Mx210BL] HID channel lost; tearing down the complete session\n"
                     );
 
                 XpmxStopInterruptReader(context);
