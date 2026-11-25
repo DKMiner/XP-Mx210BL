@@ -76,6 +76,8 @@ struct _DEVICE_CONTEXT {
     CHANNEL_CONTEXT InterruptChannel;
     INTERRUPT_READER_CONTEXT InterruptReader;
     WDFWAITLOCK SessionLock;
+    WDFWORKITEM DisconnectWorkItem;
+    volatile LONG DisconnectWorkQueued;
     volatile LONG DeviceStopping;
     VHFHANDLE VhfHandle;
     BOOLEAN VhfStarted;
@@ -104,6 +106,8 @@ static VOID XpmxReadResubmitDpc(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2
     );
+
+EVT_WDF_WORKITEM XpmxEvtDisconnectWorkItem;
 
 static
 VOID
@@ -241,6 +245,21 @@ XpmxRequestStopInterruptReader(
 
     if (reader->Request != NULL) {
         (VOID)WdfRequestCancelSentRequest(reader->Request);
+    }
+}
+
+static
+VOID
+XpmxQueueDisconnectWork(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    if (InterlockedCompareExchange(&Context->DeviceStopping, 0, 0) != 0) {
+        return;
+    }
+
+    if (InterlockedCompareExchange(&Context->DisconnectWorkQueued, 1, 0) == 0) {
+        WdfWorkItemEnqueue(Context->DisconnectWorkItem);
     }
 }
 
@@ -418,6 +437,12 @@ XpmxL2capIndicationCallback(
 
         if (matched && channel->Psm == XPMX_INTERRUPT_PSM) {
             XpmxRequestStopInterruptReader(context);
+        }
+
+        if (matched) {
+            // A single lost HID channel makes the complete HID session unusable.
+            // Defer teardown and the full ACL disconnect to PASSIVE_LEVEL.
+            XpmxQueueDisconnectWork(context);
         }
         break;
     }
@@ -1032,6 +1057,141 @@ XpmxUninitializeInterruptReader(
 
 static
 NTSTATUS
+XpmxDisconnectRemoteDevice(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    WDFREQUEST request = NULL;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_MEMORY_DESCRIPTOR input;
+    WDF_REQUEST_SEND_OPTIONS sendOptions;
+
+    if (!Context->DeviceInfoReady) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Context->Device;
+
+    status = WdfRequestCreate(
+        &attributes,
+        Context->IoTarget,
+        &request
+        );
+
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfRequestCreate(BTH_DISCONNECT_DEVICE)", status);
+        return status;
+    }
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(
+        &input,
+        &Context->RemoteDeviceInfo.address,
+        sizeof(Context->RemoteDeviceInfo.address)
+        );
+
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, 0);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(
+        &sendOptions,
+        WDF_REL_TIMEOUT_IN_SEC(12)
+        );
+
+    // Unlike BRB_L2CA_CLOSE_CHANNEL, this device-control IOCTL asks BthPort
+    // to drop the underlying ACL connection as well as any remaining channels.
+    status = WdfIoTargetSendIoctlSynchronously(
+        Context->IoTarget,
+        request,
+        IOCTL_BTH_DISCONNECT_DEVICE,
+        &input,
+        NULL,
+        &sendOptions,
+        NULL
+        );
+
+    WdfObjectDelete(request);
+
+    if (status == STATUS_DEVICE_NOT_CONNECTED) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "[XP-Mx210BL] Bluetooth ACL was already disconnected
+"
+            );
+    } else if (NT_SUCCESS(status)) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "[XP-Mx210BL] Requested full Bluetooth device disconnect
+"
+            );
+    } else {
+        XpmxLogStatus("IOCTL_BTH_DISCONNECT_DEVICE", status);
+    }
+
+    return status;
+}
+
+VOID
+XpmxEvtDisconnectWorkItem(
+    _In_ WDFWORKITEM WorkItem
+    )
+{
+    WDFDEVICE device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
+    PDEVICE_CONTEXT context = GetDeviceContext(device);
+    NTSTATUS status;
+
+    status = WdfWaitLockAcquire(context->SessionLock, NULL);
+    if (NT_SUCCESS(status)) {
+        if (InterlockedCompareExchange(&context->DeviceStopping, 0, 0) == 0) {
+            BOOLEAN controlConnected =
+                (XpmxGetChannelHandle(&context->ControlChannel) != NULL);
+            BOOLEAN interruptConnected =
+                (XpmxGetChannelHandle(&context->InterruptChannel) != NULL);
+            BOOLEAN controlDropped =
+                (InterlockedCompareExchange(&context->ControlChannel.Disconnected, 0, 0) != 0);
+            BOOLEAN interruptDropped =
+                (InterlockedCompareExchange(&context->InterruptChannel.Disconnected, 0, 0) != 0);
+
+            // The work item may have been queued by a callback belonging to an
+            // older session while a manual reconnect was already in progress.
+            if (!(controlConnected && interruptConnected &&
+                  !controlDropped && !interruptDropped)) {
+                DbgPrintEx(
+                    DPFLTR_IHVDRIVER_ID,
+                    DPFLTR_WARNING_LEVEL,
+                    "[XP-Mx210BL] HID channel lost; tearing down the complete session
+"
+                    );
+
+                XpmxStopInterruptReader(context);
+
+                (VOID)XpmxCloseL2capChannel(context, &context->InterruptChannel);
+                (VOID)XpmxCloseL2capChannel(context, &context->ControlChannel);
+
+                XpmxUninitializeInterruptReader(context);
+                XpmxStopVirtualGamepad(context);
+
+                // The channel callback only reports an L2CAP disconnect.
+                // Explicitly disconnect the ACL so the OS-level Bluetooth
+                // device state can transition to Not Connected as well.
+                (VOID)XpmxDisconnectRemoteDevice(context);
+
+                XpmxResetChannel(&context->ControlChannel);
+                XpmxResetChannel(&context->InterruptChannel);
+            }
+        }
+
+        WdfWaitLockRelease(context->SessionLock);
+    } else {
+        XpmxLogStatus("WdfWaitLockAcquire(DisconnectWorkItem)", status);
+    }
+
+    InterlockedExchange(&context->DisconnectWorkQueued, 0);
+}
+
+static
+NTSTATUS
 XpmxConnectHidSession(
     _Inout_ PDEVICE_CONTEXT Context,
     _In_z_ PCSTR Trigger
@@ -1105,10 +1265,18 @@ XpmxConnectHidSession(
         return status;
     }
 
+    status = XpmxStartVirtualGamepad(Context);
+    if (!NT_SUCCESS(status)) {
+        (VOID)XpmxCloseL2capChannel(Context, &Context->InterruptChannel);
+        (VOID)XpmxCloseL2capChannel(Context, &Context->ControlChannel);
+        return status;
+    }
+
     status = XpmxStartInterruptReader(Context);
     if (!NT_SUCCESS(status)) {
         XpmxStopInterruptReader(Context);
         XpmxUninitializeInterruptReader(Context);
+        XpmxStopVirtualGamepad(Context);
         (VOID)XpmxCloseL2capChannel(Context, &Context->InterruptChannel);
         (VOID)XpmxCloseL2capChannel(Context, &Context->ControlChannel);
         return status;
@@ -1240,6 +1408,25 @@ XpmxEvtDeviceAdd(
     }
     context->SessionLock = sessionLock;
 
+    {
+        WDF_WORKITEM_CONFIG workItemConfig;
+        WDF_OBJECT_ATTRIBUTES workItemAttributes;
+
+        WDF_WORKITEM_CONFIG_INIT(&workItemConfig, XpmxEvtDisconnectWorkItem);
+        WDF_OBJECT_ATTRIBUTES_INIT(&workItemAttributes);
+        workItemAttributes.ParentObject = device;
+
+        status = WdfWorkItemCreate(
+            &workItemConfig,
+            &workItemAttributes,
+            &context->DisconnectWorkItem
+            );
+        if (!NT_SUCCESS(status)) {
+            XpmxLogStatus("WdfWorkItemCreate(Disconnect)", status);
+            return status;
+        }
+    }
+
     status = WdfFdoQueryForInterface(
         device,
         &GUID_BTHDDI_PROFILE_DRIVER_INTERFACE,
@@ -1310,21 +1497,13 @@ XpmxEvtSelfManagedIoInit(
     }
 
     InterlockedExchange(&context->DeviceStopping, 0);
+    InterlockedExchange(&context->DisconnectWorkQueued, 0);
     XpmxResetChannel(&context->ControlChannel);
     XpmxResetChannel(&context->InterruptChannel);
     context->DeviceInfoReady = FALSE;
 
-    // VHF remains alive across ordinary controller disconnects. It is
-    // recreated only when Windows restarts this parent PnP device.
-    status = XpmxStartVirtualGamepad(context);
-    if (!NT_SUCCESS(status)) {
-        DbgPrintEx(
-            DPFLTR_IHVDRIVER_ID,
-            DPFLTR_WARNING_LEVEL,
-            "[XP-Mx210BL] VHF initialization failed; Bluetooth connection attempt will continue\n"
-            );
-    }
-
+    // The VHF child is created only after both HID L2CAP channels open.
+    // A later channel-disconnect work item removes it again.
     // One normal initial attempt on PnP start; no timer or polling loop.
     status = XpmxConnectHidSession(context, "PnP start");
     if (!NT_SUCCESS(status)) {
@@ -1368,6 +1547,10 @@ XpmxEvtSelfManagedIoCleanup(
     XpmxUninitializeInterruptReader(context);
 
     WdfWaitLockRelease(context->SessionLock);
+
+    // DeviceStopping prevents new disconnect work from being queued.
+    // Drain any callback work that was already queued before the PnP cleanup.
+    WdfWorkItemFlush(context->DisconnectWorkItem);
 }
 
 NTSTATUS
