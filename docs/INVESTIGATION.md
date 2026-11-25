@@ -39,7 +39,7 @@ The successful Android HOME+X SDP HID Report Descriptor is 208 bytes. It describ
 - Mouse, report ID `0x06`
 - Game Pad, report ID `0x07`
 
-Observed gamepad input reports start with HIDP DATA/INPUT bytes `A1 07`. The gamepad report contains four 8-bit axes (X, Y, Z, Rz), a 4-bit hat field, 15 buttons, and 8-bit accelerator/brake fields.
+Observed gamepad input reports start with HIDP DATA/INPUT bytes `A1 07`. The gamepad report contains four 8-bit axes (X, Y, Z, Rz), a 4-bit hat field, a 16-bit button field (the descriptor declares usages 1 through 15), 8-bit Accelerator and Brake fields, and padding.
 
 Example neutral report observed:
 
