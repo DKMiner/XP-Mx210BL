@@ -158,8 +158,8 @@ XpmxStartVirtualGamepad(
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "[XP-Mx210BL] VHF gamepad child started: VID=0x1949 PID=0x0402 reportID=0x07 descriptorLength=%Iu\n",
-        sizeof(XpmxGamepadReportDescriptor)
+        "[XP-Mx210BL] VHF gamepad child started: VID=0x1949 PID=0x0402 reportID=0x07 descriptorLength=%lu\n",
+        (ULONG)sizeof(XpmxGamepadReportDescriptor)
         );
 
     return STATUS_SUCCESS;
