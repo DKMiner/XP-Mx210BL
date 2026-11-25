@@ -7,7 +7,7 @@ Signature="$WINDOWS NT$"
 Class=Bluetooth
 ClassGuid={e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
 Provider=%Provider%
-DriverVer=11/25/2026,0.3.0.0
+DriverVer=11/25/2026,0.3.1.0
 CatalogFile=XpMx210BL.cat
 PnpLockdown=1
 
@@ -25,7 +25,7 @@ XpMx210BL.sys=1
 %Manufacturer%=Models,NTamd64.10.0...16299
 
 [Models.NTamd64.10.0...16299]
-%DeviceDesc%=Install, BTHENUM\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
+%DeviceDesc%=Install, BTHENUM\\{00001124-0000-1000-8000-00805F9B34FB}_VID&00021949_PID&0402
 
 [Install.NT]
 CopyFiles=DriverCopy
@@ -33,16 +33,23 @@ CopyFiles=DriverCopy
 [DriverCopy]
 XpMx210BL.sys
 
+; VHF.sys must be a lower filter in this device's stack. Keep this in the
+; hardware-install section so SetupAPI writes it to the device's filter list.
+[Install.NT.HW]
+AddReg=Install.NT.HW.AddReg
+
+[Install.NT.HW.AddReg]
+HKR,,"LowerFilters",0x00010000,"vhf"
+
 [Install.NT.Services]
 AddService=XpMx210BL,0x00000002,ServiceInstall
-HKR,,"LowerFilters",0x00010000,"vhf"
 
 [ServiceInstall]
 DisplayName=%ServiceDesc%
 ServiceType=1
 StartType=3
 ErrorControl=1
-ServiceBinary=%13%\XpMx210BL.sys
+ServiceBinary=%13%\\XpMx210BL.sys
 
 [Install.NT.Wdf]
 KmdfService=XpMx210BL,WdfSection
