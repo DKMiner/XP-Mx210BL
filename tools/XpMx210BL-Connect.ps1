@@ -66,8 +66,12 @@ internal static class XpmxControl
 
     public static string ConnectOnce()
     {
+        // P/Invoke requires ref Guid, and C# does not allow a static readonly
+        // field to be passed by reference. Use a local copy for both calls.
+        Guid interfaceGuid = InterfaceGuid;
+
         uint length;
-        int result = GetInterfaceListSize(out length, ref InterfaceGuid,
+        int result = GetInterfaceListSize(out length, ref interfaceGuid,
             IntPtr.Zero, 0);
         if (result != 0 || length < 2)
             throw new InvalidOperationException(
@@ -75,7 +79,7 @@ internal static class XpmxControl
                 "Make sure laptop Bluetooth is enabled and the paired HID device is started.");
 
         StringBuilder list = new StringBuilder(checked((int)length));
-        result = GetInterfaceList(ref InterfaceGuid, IntPtr.Zero, list, length, 0);
+        result = GetInterfaceList(ref interfaceGuid, IntPtr.Zero, list, length, 0);
         if (result != 0)
             throw new InvalidOperationException(
                 "Windows could not enumerate the driver control interface (CONFIGRET " +
