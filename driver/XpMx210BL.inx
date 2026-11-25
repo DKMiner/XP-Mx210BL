@@ -1,4 +1,4 @@
-; XP-Mx210BL controller-specific Bluetooth HID profile probe.
+; XP-Mx210BL controller-specific Bluetooth HID profile receive probe.
 ; This INF intentionally matches only the XP-Mx210BL's HID service + VID/PID.
 ; Do not broaden this match to the generic BTHENUM HID compatible ID.
 
@@ -7,7 +7,7 @@ Signature="$WINDOWS NT$"
 Class=Bluetooth
 ClassGuid={e0cbf06c-cd8b-4647-bb8a-263b43f0f974}
 Provider=%Provider%
-DriverVer=11/25/2026,0.1.0.0
+DriverVer=11/25/2026,0.2.0.0
 CatalogFile=XpMx210BL.cat
 PnpLockdown=1
 
