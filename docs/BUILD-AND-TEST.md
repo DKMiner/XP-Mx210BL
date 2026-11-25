@@ -1,137 +1,81 @@
-# XP-Mx210BL driver: build and test
+# XP-Mx210BL driver: build and hardware-test record
 
-This is a test-signed development prototype, not a production release. The VHF gamepad path has been hardware-tested in joy.cpl, Terraria, and Dead Cells. The manual reconnect control added in the current branch still requires a target-machine build and test.
+The Bluetooth HID transport, VHF gamepad, manual one-shot reconnect, and disconnect lifecycle have been hardware-tested on the developer's HP 250 G6 (Windows 11 Pro 22H2 build 22621.4317, Intel Wireless Bluetooth). Input was verified in `joy.cpl`, Terraria, and Dead Cells. The user also confirmed that Windows Bluetooth Settings and Steam reflect the controller disconnect. This is still a development build, not a production-signed release.
 
 ## Current implementation
 
-The source driver:
-
 - Opens the controller's HID Control and Interrupt L2CAP channels.
-- Receives Interrupt-channel packets with a pending BRB_L2CA_ACL_TRANSFER request and re-submits the read after each completion.
-- Creates a VHF child using the 97-byte Game Pad-only descriptor only after both HID L2CAP channels have opened.
-- Accepts only 12-byte HIDP DATA/INPUT packets with prefix A1 07.
-- Removes the HIDP header byte A1 and forwards the 11-byte HID report (Report ID 07 plus the ten-byte payload) with HID_XFER_PACKET / VhfReadReportSubmit.
-- Uses VHF's default input-report buffering.
-- On either channel's remote disconnect, queues PASSIVE_LEVEL teardown work, stops the reader, closes the remaining L2CAP channel, deletes the VHF child, and requests a full ACL disconnect with IOCTL_BTH_DISCONNECT_DEVICE.
-- A later manual Connect creates a fresh VHF child after both channels open. No periodic retry or polling loop is used.
+- Receives Interrupt-channel packets through a pending `BRB_L2CA_ACL_TRANSFER` read and re-submits the read after successful completion.
+- Creates a VHF child using the 97-byte Game Pad-only report descriptor after both HID L2CAP channels open.
+- Accepts 12-byte HIDP DATA/INPUT packets with prefix `A1 07`.
+- Removes the HIDP header byte `A1` and forwards the 11-byte HID report (Report ID `07` plus ten payload bytes) through `HID_XFER_PACKET` / `VhfReadReportSubmit`.
+- On either channel's remote disconnect, queues teardown work, stops the reader, closes the remaining channel, deletes the VHF child, and requests a full ACL disconnect using `IOCTL_BTH_DISCONNECT_DEVICE`.
+- Supports one initial PnP-start connection attempt and explicit one-shot reconnect requests. No periodic retry or polling loop is used.
 
-The current branch adds an administrator-only control interface and one-shot Connect IOCTL. The companion PowerShell/C# helper in tools/XpMx210BL-Connect.ps1 displays a Connect button. Each click submits one request to the driver. No periodic retry timer or background polling is implemented.
+## Development build
 
-## Build
-
-1. Open driver/XpMx210BL.vcxproj in Visual Studio 2022.
+1. Open `driver/XpMx210BL.vcxproj` in Visual Studio 2022 with a compatible WDK installed.
 2. Select **Debug | x64**.
-3. Rebuild the project.
-4. Inspect build output for compiler/linker warnings and errors.
+3. Rebuild and inspect compiler/linker output.
+4. Inspect the generated INF and catalog. Confirm that the INF still matches only the controller's HID service UUID + VID/PID and that VHF is registered as the intended lower filter.
+5. Verify the catalog with SignTool before installing.
+6. Install only on a recoverable test machine:
 
-The project links VhfKm.lib. The INF registers vhf as a lower filter in [Install.NT.HW] via [Install.NT.HW.AddReg]:
+```powershell
+pnputil /add-driver "path\to\XpMx210BL.inf" /install
+```
 
-~~~ini
-[Install.NT.HW]
-AddReg=Install.NT.HW.AddReg
+Record the published `oemNN.inf` name returned by PnPUtil.
 
-[Install.NT.HW.AddReg]
-HKR,,"LowerFilters",0x00010000,"vhf"
-~~~
+The hardware-tested package was locally test-signed and installed with Windows Test Mode enabled and Secure Boot disabled. This branch does not claim a Release build, normal signature enforcement, Secure Boot-on, or HVCI validation. A local build is not an end-user release.
 
-Do not move this value into [Install.NT.Services].
+## Test the Connect helper
 
-## Package verification
-
-Use the generated package folder:
-
-~~~powershell
-$pkg = 'D:\Projects\XP-Mx210BL\driver\x64\Debug\XpMx210BL'
-
-Select-String "$pkg\XpMx210BL.inf" -Pattern '^\s*DriverVer\s*=', '^\[Install\.NT\.HW\]', '^AddReg=Install\.NT\.HW\.AddReg', '^\[Install\.NT\.HW\.AddReg\]', 'LowerFilters.*vhf'
-~~~
-
-Verify the package catalog using SignTool (locate the x64 signtool.exe under Windows Kits\10\bin as in the earlier build instructions):
-
-~~~powershell
-& $signtool verify /pa /v /c "$pkg\xpmx210bl.cat" "$pkg\XpMx210BL.inf"
-~~~
-
-Expected: SignTool reports successful verification with no errors. Do not install a package that failed build or catalog verification.
-
-## Install
-
-Keep the existing known-working gamepad package available for rollback. Install the new package only after the checks above pass:
-
-~~~powershell
-pnputil /add-driver "$pkg\XpMx210BL.inf" /install
-~~~
-
-Record the actual published oemNN.inf name.
-
-## Test initial connection
-
-1. Start DebugView as administrator with Capture Events and Capture Kernel enabled.
-2. Wake the paired controller in HOME+X mode.
-3. Confirm the Bluetooth service node is Started and bound to the new package.
-4. Look for:
-   ~~~text
-   [XP-Mx210BL] VHF gamepad child started: VID=0x1949 PID=0x0402 reportID=0x07 descriptorLength=97
-   [XP-Mx210BL] Remote BD_ADDR=0x... flags=0x... connected=...
-   [XP-Mx210BL] HID Control opened: PSM=0x0011 ...
-   [XP-Mx210BL] HID Interrupt opened: PSM=0x0013 ...
-   [XP-Mx210BL] Continuous HID Interrupt reader started
-   ~~~
-5. Run joy.cpl and verify the gamepad.
-
-## Test manual reconnect
-
-The driver performs one connection attempt on PnP start. After a controller-side disconnect, it does not poll or retry automatically. To request another connection:
-
-1. Leave laptop Bluetooth enabled.
-2. Turn the controller on in HOME+X mode.
-3. From the repository root, launch the companion window:
-   ~~~powershell
-   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\XpMx210BL-Connect.ps1
-   ~~~
-   It requests elevation automatically if the current PowerShell session is not elevated.
-4. Alternatively, launch the helper directly by double-clicking `tools\\Launch-XpMx210BL-Connect.cmd`. It starts the same PowerShell/WinForms helper with its console hidden; Windows still displays a UAC prompt when elevation is needed.
+1. Leave the laptop's Bluetooth radio enabled.
+2. Turn the paired controller on in **HOME + X** mode.
+3. Double-click `tools/Launch-XpMx210BL-Connect.cmd`.
+4. Accept the UAC prompt.
 5. Click **Connect** once.
-6. A successful request should display a success message and DebugView should show:
-   ~~~text
-   [XP-Mx210BL] Connect attempt requested (user request); no background retry is scheduled
-   [XP-Mx210BL] HID Control opened: PSM=0x0011 ...
-   [XP-Mx210BL] HID Interrupt opened: PSM=0x0013 ...
-   [XP-Mx210BL] Continuous HID Interrupt reader started
-   [XP-Mx210BL] HID session connected (user request); both channels and reader are active
-   ~~~
 
-If the attempt fails, the status shown by the app and the associated DebugView lines should be captured. Turn the controller on before clicking Connect. The IOCTL performs one attempt; it does not keep trying while the controller is off.
+Each click is one connection attempt. The helper does not poll or retry in the background. It is a companion window, not a control inside Windows Bluetooth Settings.
 
-## Test controller disconnect and reconnect
+## Test controller disconnect
 
-1. With the controller connected in HOME+X, turn the controller off.
-2. DebugView should show the disconnect worker tearing down the session, followed by either:
-   - `[XP-Mx210BL] Requested full Bluetooth device disconnect`, or
-   - `[XP-Mx210BL] Bluetooth ACL was already disconnected`.
-3. DebugView should also show `[XP-Mx210BL] VHF gamepad child deleted`.
-4. Check Windows Settings: the paired controller should transition to **Not Connected**. Check `joy.cpl`: the virtual gamepad should disappear.
-5. Turn the controller back on in HOME+X and click Connect. The driver should recreate the VHF child and restore input.
+1. Connect the controller in HOME + X mode.
+2. Turn the controller off.
+3. The driver should stop the Interrupt reader, close any remaining L2CAP channel, delete the VHF gamepad child, and request a full Bluetooth ACL disconnect.
+4. Confirm the virtual gamepad disappears from `joy.cpl`.
+5. Confirm Windows Bluetooth Settings reports **Not connected** and Steam no longer shows the gamepad as connected.
+6. Turn the controller on in HOME + X mode and click Connect to create a fresh session.
 
-If the Settings state remains Connected, capture the disconnect callback reason and the `IOCTL_BTH_DISCONNECT_DEVICE` status from DebugView. If the disconnect IOCTL fails, do not repeatedly click Connect; report the exact status first.
-
-Turning laptop Bluetooth off/on remains a separate PnP restart test.
+These disconnect outcomes were confirmed on the target laptop.
 
 ## Manual interface details
 
-- Device interface GUID: {7F44E8AF-4C2B-4C86-8EF5-CF49E2B5DA18}
-- Connect IOCTL: 0x22E000
-- The interface is restricted to LocalSystem and elevated Administrators.
-- The PowerShell helper enumerates the device interface and submits the IOCTL; it performs no polling.
-- This is a companion Connect window, not an extension to Windows Bluetooth Settings / Quick Settings.
+- Device interface GUID: `{7F44E8AF-4C2B-4C86-8EF5-CF49E2B5DA18}`
+- Connect IOCTL: `0x22E000`
+- Interface access: LocalSystem and elevated Administrators.
+- Companion source: `tools/XpMx210BL-Connect.ps1`
+- Double-click launcher: `tools/Launch-XpMx210BL-Connect.cmd`
 
 ## Rollback
 
-Record the published package name returned by PnPUtil. To remove only the new prototype package:
+Record the published package name returned by PnPUtil. To remove only the prototype package:
 
-~~~powershell
+```powershell
 pnputil /delete-driver oemNN.inf /uninstall
 pnputil /scan-devices
-~~~
+```
 
-Replace oemNN.inf with the actual new package name. Do not use /force. Keep the previously working VHF package available until the manual-connect revision has passed testing.
+Replace `oemNN.inf` with the recorded package name. Do not use `/force`.
+
+## Not yet validated
+
+- Secure Boot enabled with Windows Test Mode disabled.
+- Microsoft production signing, attestation/WHCP submission, and HLK certification.
+- Memory Integrity / HVCI on the target laptop.
+- Sleep/resume, hibernate, fast startup, Bluetooth radio power transitions, and lengthy reconnect stress tests.
+- Install, upgrade, and uninstall on a clean second machine.
+- Compatibility with Windows releases other than the recorded 22H2 build.
+
+See [Signing Research and Current Blocker](RELEASE-AND-SIGNING.md) for the paused signing path and future validation gates.
