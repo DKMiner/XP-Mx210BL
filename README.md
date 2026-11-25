@@ -1,58 +1,60 @@
-# XP-Mx210BL Bluetooth HID driver
+# XP-Mx210BL
 
-A Windows KMDF Bluetooth profile-driver experiment for the XP-7018L / XP-Mx210BL controller.
+A Windows Bluetooth Classic HID profile-driver prototype for the XP-Mx210BL / XP-7018L controller. It receives the controller's Bluetooth HID reports and exposes the Game Pad collection to Windows through Microsoft's Virtual HID Framework (VHF).
 
-## Current status
+> **Project status — 2026-11-25:** The Bluetooth transport, VHF gamepad, one-shot reconnect utility, and controller-disconnect teardown have been tested on the developer's HP 250 G6. This is a working, test-signed development prototype, not a production-signed driver. Work on public signing is paused because the Microsoft Hardware Developer Program requires organization-level enrollment prerequisites; no supported individual, machine-only signing route has been identified. The source is being kept as a known-tested snapshot on `work/l2cap-probe`.
 
-**Bluetooth transport and HIDP receive: hardware-tested.** The custom profile driver opens HID Control PSM 0x0011 and HID Interrupt PSM 0x0013 through the laptop's Intel Bluetooth adapter. It receives valid 12-byte gamepad reports.
+## What has been tested
 
-**VHF virtual gamepad: hardware-tested in games.** The exact 97-byte Game Pad collection from the controller's original SDP descriptor is exposed through VHF. The user verified the controls in joy.cpl, Terraria, and Dead Cells.
+- Bluetooth Classic HID in **HOME + X mode**.
+- HID Control and Interrupt L2CAP channels, PSM `0x0011` and `0x0013`.
+- Incoming 12-byte HIDP gamepad packets with Report ID `0x07`.
+- The 97-byte Game Pad-only report descriptor exposed through VHF as VID `0x1949`, PID `0x0402`.
+- Native gamepad input in `joy.cpl`, Terraria, and Dead Cells.
+- The companion Connect utility makes one explicit connection attempt per click; no periodic retry or polling loop is used.
+- When the controller is switched off, the driver tears down the session, removes the VHF child, and requests a full Bluetooth ACL disconnect. Windows Bluetooth Settings and Steam showed the device as disconnected during testing.
 
-**Manual reconnect control: implementation committed, target build/test pending.** The driver now exposes an administrator-only device interface and a one-shot Connect IOCTL. The companion tools/XpMx210BL-Connect.ps1 opens a small window with a Connect button. Each click makes one connection attempt; there is no periodic retry timer or background polling. PnP device start still performs one normal initial connection attempt.
+## Compatibility and scope
 
-We have not found a documented extension point for adding a custom HID profile driver's Connect button to the native Windows Bluetooth Settings / Quick Settings flyout. The companion window is the explicit control path implemented by this project.
+| Item | Tested scope |
+|---|---|
+| Controller | XP-Mx210BL / XP-7018L |
+| Controller mode | HOME + X |
+| Bluetooth service | Classic HID, UUID `00001124-0000-1000-8000-00805F9B34FB` |
+| Remote VID / PID | `1949` / `0402` |
+| Architecture | x64 |
+| Windows | Windows 11 Pro 22H2, build 22621.4317 |
+| Host | HP 250 G6, Intel Wireless Bluetooth (USB `VID_8087&PID_0AA7`) |
 
-The project remains a test-signed development prototype, not a production driver. Keep the known-working VHF package available for rollback until the manual-connect revision is built and tested.
+This is a report of one tested machine, not a compatibility promise for other Windows versions, editions, Bluetooth adapters, or computers. HOME-only and other controller modes are not supported by this implementation.
 
-Development branch: [work/l2cap-probe](https://github.com/DKMiner/XP-Mx210BL/tree/work/l2cap-probe).
+## Signing and Windows security status
 
-## Roadmap
+The tested package was locally test-signed and loaded while Windows Test Mode was enabled and Secure Boot was disabled. That is a development-only setup. After Test Mode is disabled and normal kernel signature enforcement is restored, Windows is expected to refuse to load this test-signed driver. The package can remain in the Driver Store; uninstalling it is not required just to restore normal Windows boot settings. The controller's Bluetooth HID function will not use this prototype until a supported signed package or a different implementation is available.
 
-1. Bluetooth transport and HIDP receive: hardware-tested.
-2. VHF virtual gamepad: hardware-tested in joy.cpl and games.
-3. Explicit reconnect: one connection attempt from a companion Connect window. Source committed; target build/test pending.
-4. Connection-state diagnostics: log the Bluetooth stack's BDIF_CONNECTED state.
-5. Release preparation: complete lifecycle testing and pursue the appropriate Microsoft driver-signing route.
+Memory Integrity / HVCI, Secure Boot-on operation, normal-signature-enforcement operation, HLK validation, and WHCP certification have not been validated for this driver. Do not distribute the test-signed package.
 
-There is no automatic retry loop. A user clicks Connect when the controller is awake in HOME+X mode.
+## Build and tools
 
-## Known hardware identity
+- Visual Studio 2022 with the C++ desktop workload.
+- Windows Driver Kit (WDK) and a compatible Windows SDK.
+- A recoverable Windows test installation for kernel-driver experiments.
 
-- Bluetooth device name: XP-Mx210BL
-- Bluetooth address observed in Windows: 00:90:E1:5C:17:C2
-- Remote HID service UUID: 00001124-0000-1000-8000-00805F9B34FB
-- SDP PnP identity: VID 1949, PID 0402
-- HID Control PSM: 0x0011
-- HID Interrupt PSM: 0x0013
-- Manual control interface GUID: {7F44E8AF-4C2B-4C86-8EF5-CF49E2B5DA18}
+The companion Connect tool is in `tools/`. Double-click `tools/Launch-XpMx210BL-Connect.cmd`; Windows displays a UAC prompt because the control interface is administrator-only. It launches the PowerShell/WinForms helper, not a standalone executable.
 
-See docs/INVESTIGATION.md, docs/ARCHITECTURE.md, docs/RESEARCH.md, docs/BUILD-AND-TEST.md, driver/README.md, and protocol/README.md.
+## Documentation
 
-## Development requirements
+- [Architecture](docs/ARCHITECTURE.md)
+- [Build and hardware test notes](docs/BUILD-AND-TEST.md)
+- [Investigation record and target-machine results](docs/INVESTIGATION.md)
+- [Protocol fixtures](protocol/README.md)
+- [Microsoft signing research and current blocker](docs/RELEASE-AND-SIGNING.md)
+- [Future validation checklist](docs/RELEASE-CHECKLIST.md)
 
-- Windows 10/11 x64
-- Visual Studio 2022 with the C++ desktop workload
-- Windows Driver Kit (WDK) and matching Windows SDK
-- A recoverable Windows installation is strongly recommended for kernel-driver experiments
+## Safety
 
-## References
-
-- [Microsoft: Installing a Bluetooth Device](https://learn.microsoft.com/en-us/windows-hardware/drivers/bluetooth/installing-a-bluetooth-device)
-- [Microsoft: Bluetooth driver stack](https://learn.microsoft.com/en-us/windows-hardware/drivers/bluetooth/using-the-bluetooth-driver-stack)
-- [Microsoft: Creating a L2CAP client connection](https://learn.microsoft.com/en-us/windows-hardware/drivers/bluetooth/creating-a-l2cap-client-connection-to-a-remote-device)
-- [Microsoft: BluetoothSetServiceState](https://learn.microsoft.com/en-us/windows/win32/api/bluetoothapis/nf-bluetoothapis-bluetoothsetservicestate)
-- [Microsoft: Virtual HID Framework](https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/virtual-hid-framework--vhf-)
+This is third-party kernel-mode code. A faulty driver can crash Windows or prevent this controller's Bluetooth HID service from starting. Keep a recovery path and do not install development builds on a computer you cannot recover.
 
 ## License
 
-Project code is licensed under the MIT License. Third-party code, if incorporated, will retain its original license and attribution.
+MIT. See [LICENSE](LICENSE).
