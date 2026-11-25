@@ -101,7 +101,7 @@ internal static class XpmxControl
             }
         }
 
-        return "Connection established. Check joy.cpl or DebugView for input reports.";
+        return "Both HID channels opened and the input reader is active. Verify input in joy.cpl or DebugView.";
     }
 }
 
