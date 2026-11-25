@@ -8,11 +8,12 @@ The source driver:
 
 - Opens the controller's HID Control and Interrupt L2CAP channels.
 - Receives Interrupt-channel packets with a pending BRB_L2CA_ACL_TRANSFER request and re-submits the read after each completion.
-- Creates a VHF child using the 97-byte Game Pad-only descriptor.
+- Creates a VHF child using the 97-byte Game Pad-only descriptor only after both HID L2CAP channels have opened.
 - Accepts only 12-byte HIDP DATA/INPUT packets with prefix A1 07.
 - Removes the HIDP header byte A1 and forwards the 11-byte HID report (Report ID 07 plus the ten-byte payload) with HID_XFER_PACKET / VhfReadReportSubmit.
 - Uses VHF's default input-report buffering.
-- Stops and drains the Bluetooth reader before deleting the VHF child during PnP cleanup.
+- On either channel's remote disconnect, queues PASSIVE_LEVEL teardown work, stops the reader, closes the remaining L2CAP channel, deletes the VHF child, and requests a full ACL disconnect with IOCTL_BTH_DISCONNECT_DEVICE.
+- A later manual Connect creates a fresh VHF child after both channels open. No periodic retry or polling loop is used.
 
 The current branch adds an administrator-only control interface and one-shot Connect IOCTL. The companion PowerShell/C# helper in tools/XpMx210BL-Connect.ps1 displays a Connect button. Each click submits one request to the driver. No periodic retry timer or background polling is implemented.
 
@@ -101,7 +102,19 @@ The driver performs one connection attempt on PnP start. After a controller-side
 
 If the attempt fails, the status shown by the app and the associated DebugView lines should be captured. Turn the controller on before clicking Connect. The IOCTL performs one attempt; it does not keep trying while the controller is off.
 
-Also test that turning the controller off leaves the VHF gamepad child present until Windows actually stops/removes the parent Bluetooth service device. Turning laptop Bluetooth off/on is a separate PnP restart test.
+## Test controller disconnect and reconnect
+
+1. With the controller connected in HOME+X, turn the controller off.
+2. DebugView should show the disconnect worker tearing down the session, followed by either:
+   - `[XP-Mx210BL] Requested full Bluetooth device disconnect`, or
+   - `[XP-Mx210BL] Bluetooth ACL was already disconnected`.
+3. DebugView should also show `[XP-Mx210BL] VHF gamepad child deleted`.
+4. Check Windows Settings: the paired controller should transition to **Not Connected**. Check `joy.cpl`: the virtual gamepad should disappear.
+5. Turn the controller back on in HOME+X and click Connect. The driver should recreate the VHF child and restore input.
+
+If the Settings state remains Connected, capture the disconnect callback reason and the `IOCTL_BTH_DISCONNECT_DEVICE` status from DebugView. If the disconnect IOCTL fails, do not repeatedly click Connect; report the exact status first.
+
+Turning laptop Bluetooth off/on remains a separate PnP restart test.
 
 ## Manual interface details
 
