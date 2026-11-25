@@ -90,3 +90,43 @@ The previous trace appears to show service discovery completing before the HID t
 Windows successfully enumerates the remote HID SDP service but the in-box `HidBth` profile driver fails during initialization or connection setup. The prototype will replace the profile driver **only for this exact remote HID service instance** and report the status returned by the Bluetooth stack for each L2CAP BRB.
 
 This is a hypothesis to test. It is not yet proven that the Intel adapter is innocent or that the in-box driver alone is defective.
+
+## Custom profile-driver test (2026-11-25)
+
+The controller-specific profile driver package was successfully test-signed, staged, ranked above the generic inbox HID match, and installed on the exact remote HID service instance.
+
+Observed PnP state after installation:
+
+- Device description: XP-Mx210BL Bluetooth HID Profile (Probe)
+- Setup class: Bluetooth
+- PnP status: Started / OK
+- Published driver package: oem111.inf
+- The prior hidbth.inf binding is no longer selected for this service instance.
+
+The user observed that the controller's connection LEDs became steady and remained steady after restarting the custom Bluetooth HID service device. This indicates that the custom profile node starts and that the controller recognizes a live Bluetooth connection state; it does not by itself prove HIDP initialization or usable gamepad input.
+
+### Stage 1 BRB results
+
+The first DebugView kernel capture recorded:
+
+- One initial HID Control open failure: NTSTATUS 0xC00000C2, Bluetooth BRB status 0, Bluetooth status 0x1F.
+- A later successful HID Control open on PSM 0x0011 with inbound/outbound MTU 672.
+- A successful HID Interrupt open on PSM 0x0013 with inbound/outbound MTU 672.
+- A successful orderly close of both channels.
+- A subsequent successful reopen of both channels.
+
+A later capture included multiple cycles of remote disconnect indications, device-node restarts, and successful opens of both PSMs again. It also showed close attempts returning 0xC000009D after remote disconnects had already invalidated the channels.
+
+These logs establish that the Windows Bluetooth stack can open both HID L2CAP channels through the custom profile driver. They do not establish that HIDP control transactions or input-report reception work yet.
+
+### Stage 2 receive probe
+
+The next code revision adds:
+
+- Separate per-channel state and handles.
+- Remote-disconnect handling that invalidates only the affected channel handle and sets CloseNow.
+- Cancellation and rundown of a pending inbound BRB_L2CA_ACL_TRANSFER read on the Interrupt channel.
+- Re-submission of the read after successful completion.
+- Logging of the transfer length, remaining buffer size, and first 16 bytes.
+
+The Stage 2 revision is committed but has not yet been built or hardware-tested on the target laptop. The next test must confirm the actual HIDP bytes received from the controller before HIDP parsing and VHF work proceed.
