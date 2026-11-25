@@ -40,6 +40,9 @@
       <ConformanceMode>true</ConformanceMode>
     </ClCompile>
     <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)vhfkm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\driver.c" />
