@@ -819,6 +819,7 @@ failed:
     return status;
 }
 
+#if DBG
 static
 VOID
 XpmxLogInterruptPacket(
@@ -854,6 +855,7 @@ XpmxLogInterruptPacket(
         hexBuffer
         );
 }
+#endif // DBG
 
 static
 VOID
@@ -880,11 +882,13 @@ XpmxReadCompletion(
         }
 
         if (bytesRead != 0) {
+#if DBG
             XpmxLogInterruptPacket(
                 reader->Buffer,
                 bytesRead,
                 reader->Brb.RemainingBufferSize
                 );
+#endif // DBG
 
             // Bluetooth HIDP DATA/INPUT: 0xA1, followed by the HID report ID.
             // VHF's HID_XFER_PACKET reportBuffer includes the report ID byte,
