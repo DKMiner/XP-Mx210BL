@@ -19,6 +19,10 @@
 #define XPMX_GAMEPAD_REPORT_ID 0x07
 #define XPMX_GAMEPAD_PACKET_LENGTH 12
 #define XPMX_VHF_REPORT_BUFFER_LENGTH 11
+#define IOCTL_XPMX_CONNECT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+
+static const GUID GUID_DEVINTERFACE_XPMX_CONTROL =
+{ 0x7f44e8af, 0x4c2b, 0x4c86, { 0x8e, 0xf5, 0xcf, 0x49, 0xe2, 0xb5, 0xda, 0x18 } };
 
 // Extracted verbatim as the Game Pad top-level collection from the
 // controller's 208-byte HOME+X SDP report descriptor.
@@ -71,6 +75,8 @@ struct _DEVICE_CONTEXT {
     CHANNEL_CONTEXT ControlChannel;
     CHANNEL_CONTEXT InterruptChannel;
     INTERRUPT_READER_CONTEXT InterruptReader;
+    WDFWAITLOCK SessionLock;
+    volatile LONG DeviceStopping;
     VHFHANDLE VhfHandle;
     BOOLEAN VhfStarted;
     BOOLEAN ProfileInterfaceReady;
@@ -83,6 +89,7 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD XpmxEvtDeviceAdd;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT XpmxEvtSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP XpmxEvtSelfManagedIoCleanup;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL XpmxEvtIoDeviceControl;
 
 static VOID XpmxReadCompletion(
     _In_ WDFREQUEST Request,
@@ -350,8 +357,10 @@ XpmxGetRemoteDeviceInfo(
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_INFO_LEVEL,
-            "[XP-Mx210BL] Remote BD_ADDR=0x%012I64X\n",
-            Context->RemoteDeviceInfo.address
+            "[XP-Mx210BL] Remote BD_ADDR=0x%012I64X flags=0x%08lX connected=%u\n",
+            Context->RemoteDeviceInfo.address,
+            (ULONG)Context->RemoteDeviceInfo.flags,
+            (Context->RemoteDeviceInfo.flags & BDIF_CONNECTED) ? 1u : 0u
             );
     } else {
         XpmxLogStatus("IOCTL_INTERNAL_BTHENUM_GET_DEVINFO", status);
@@ -522,7 +531,7 @@ XpmxOpenL2capChannel(
 }
 
 static
-VOID
+NTSTATUS
 XpmxCloseL2capChannel(
     _Inout_ PDEVICE_CONTEXT Context,
     _Inout_ PCHANNEL_CONTEXT Channel
@@ -533,12 +542,12 @@ XpmxCloseL2capChannel(
     struct _BRB_L2CA_CLOSE_CHANNEL* brb;
 
     if (!Context->ProfileInterfaceReady || !Context->DeviceInfoReady) {
-        return;
+        return STATUS_SUCCESS;
     }
 
     handle = XpmxGetChannelHandle(Channel);
     if (handle == NULL) {
-        return;
+        return STATUS_SUCCESS;
     }
 
     brb = (struct _BRB_L2CA_CLOSE_CHANNEL*)Context->ProfileInterface.BthAllocateBrb(
@@ -548,7 +557,7 @@ XpmxCloseL2capChannel(
 
     if (brb == NULL) {
         XpmxLogStatus("BthAllocateBrb(CLOSE_CHANNEL)", STATUS_INSUFFICIENT_RESOURCES);
-        return;
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     Context->ProfileInterface.BthReuseBrb((PBRB)brb, BRB_L2CA_CLOSE_CHANNEL);
@@ -570,6 +579,18 @@ XpmxCloseL2capChannel(
             Channel->Name,
             handle
             );
+
+        {
+            KIRQL oldIrql;
+            KeAcquireSpinLock(&Channel->Lock, &oldIrql);
+
+            if (Channel->Handle == handle) {
+                Channel->Handle = NULL;
+                InterlockedExchange(&Channel->Disconnected, 1);
+            }
+
+            KeReleaseSpinLock(&Channel->Lock, oldIrql);
+        }
     } else {
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
@@ -578,21 +599,15 @@ XpmxCloseL2capChannel(
             Channel->Name,
             (ULONG)status
             );
+
+        // A concurrent disconnect callback may already have invalidated it.
+        if (XpmxGetChannelHandle(Channel) != handle) {
+            status = STATUS_SUCCESS;
+        }
     }
 
     Context->ProfileInterface.BthFreeBrb((PBRB)brb);
-
-    {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&Channel->Lock, &oldIrql);
-
-        if (Channel->Handle == handle) {
-            Channel->Handle = NULL;
-            InterlockedExchange(&Channel->Disconnected, 1);
-        }
-
-        KeReleaseSpinLock(&Channel->Lock, oldIrql);
-    }
+    return status;
 }
 
 static
@@ -1015,6 +1030,138 @@ XpmxUninitializeInterruptReader(
     RtlZeroMemory(reader, sizeof(*reader));
 }
 
+static
+NTSTATUS
+XpmxConnectHidSession(
+    _Inout_ PDEVICE_CONTEXT Context,
+    _In_z_ PCSTR Trigger
+    )
+{
+    NTSTATUS status;
+    PINTERRUPT_READER_CONTEXT reader = &Context->InterruptReader;
+
+    if (InterlockedCompareExchange(&Context->DeviceStopping, 0, 0) != 0) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (XpmxGetChannelHandle(&Context->ControlChannel) != NULL &&
+        XpmxGetChannelHandle(&Context->InterruptChannel) != NULL &&
+        InterlockedCompareExchange(&reader->Initialized, 0, 0) != 0 &&
+        InterlockedCompareExchange(&reader->Running, 0, 0) != 0 &&
+        InterlockedCompareExchange(&reader->Stopping, 0, 0) == 0) {
+        DbgPrintEx(
+            DPFLTR_IHVDRIVER_ID,
+            DPFLTR_INFO_LEVEL,
+            "[XP-Mx210BL] Connect requested (%s): already connected\n",
+            Trigger
+            );
+        return STATUS_SUCCESS;
+    }
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] Connect attempt requested (%s); no background retry is scheduled\n",
+        Trigger
+        );
+
+    // Drain the old reader before disposing it or touching either channel.
+    XpmxStopInterruptReader(Context);
+    XpmxUninitializeInterruptReader(Context);
+
+    status = XpmxCloseL2capChannel(Context, &Context->InterruptChannel);
+    if (!NT_SUCCESS(status) &&
+        XpmxGetChannelHandle(&Context->InterruptChannel) != NULL) {
+        return status;
+    }
+
+    status = XpmxCloseL2capChannel(Context, &Context->ControlChannel);
+    if (!NT_SUCCESS(status) &&
+        XpmxGetChannelHandle(&Context->ControlChannel) != NULL) {
+        return status;
+    }
+
+    XpmxResetChannel(&Context->ControlChannel);
+    XpmxResetChannel(&Context->InterruptChannel);
+
+    status = XpmxGetRemoteDeviceInfo(Context);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = XpmxOpenL2capChannel(Context, &Context->ControlChannel);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = XpmxOpenL2capChannel(Context, &Context->InterruptChannel);
+    if (!NT_SUCCESS(status)) {
+        (VOID)XpmxCloseL2capChannel(Context, &Context->ControlChannel);
+        return status;
+    }
+
+    status = XpmxStartInterruptReader(Context);
+    if (!NT_SUCCESS(status)) {
+        XpmxStopInterruptReader(Context);
+        XpmxUninitializeInterruptReader(Context);
+        (VOID)XpmxCloseL2capChannel(Context, &Context->InterruptChannel);
+        (VOID)XpmxCloseL2capChannel(Context, &Context->ControlChannel);
+        return status;
+    }
+
+    DbgPrintEx(
+        DPFLTR_IHVDRIVER_ID,
+        DPFLTR_INFO_LEVEL,
+        "[XP-Mx210BL] HID session connected (%s); both channels and reader are active\n",
+        Trigger
+        );
+    return STATUS_SUCCESS;
+}
+
+VOID
+XpmxEvtIoDeviceControl(
+    _In_ WDFQUEUE Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t OutputBufferLength,
+    _In_ size_t InputBufferLength,
+    _In_ ULONG IoControlCode
+    )
+{
+    NTSTATUS status;
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    PDEVICE_CONTEXT context = GetDeviceContext(device);
+
+    if (IoControlCode != IOCTL_XPMX_CONNECT) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_REQUEST);
+        return;
+    }
+
+    if (InputBufferLength != 0 || OutputBufferLength != 0) {
+        WdfRequestComplete(Request, STATUS_INVALID_BUFFER_SIZE);
+        return;
+    }
+
+    if (InterlockedCompareExchange(&context->DeviceStopping, 0, 0) != 0) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+
+    status = WdfWaitLockAcquire(context->SessionLock, NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    if (InterlockedCompareExchange(&context->DeviceStopping, 0, 0) != 0) {
+        status = STATUS_DEVICE_NOT_READY;
+    } else {
+        status = XpmxConnectHidSession(context, "user request");
+    }
+
+    WdfWaitLockRelease(context->SessionLock);
+    WdfRequestComplete(Request, status);
+}
+
 NTSTATUS
 XpmxEvtDeviceAdd(
     _In_ WDFDRIVER Driver,
@@ -1024,8 +1171,14 @@ XpmxEvtDeviceAdd(
     NTSTATUS status;
     WDFDEVICE device;
     WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES lockAttributes;
+    WDF_OBJECT_ATTRIBUTES queueAttributes;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDFQUEUE queue;
+    WDFWAITLOCK sessionLock;
     WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
     PDEVICE_CONTEXT context;
+    UNICODE_STRING deviceSddl;
 
     UNREFERENCED_PARAMETER(Driver);
 
@@ -1033,6 +1186,14 @@ XpmxEvtDeviceAdd(
     pnpCallbacks.EvtDeviceSelfManagedIoInit = XpmxEvtSelfManagedIoInit;
     pnpCallbacks.EvtDeviceSelfManagedIoCleanup = XpmxEvtSelfManagedIoCleanup;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
+
+    // Only LocalSystem and elevated administrators may issue control IOCTLs.
+    RtlInitUnicodeString(&deviceSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &deviceSddl);
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfDeviceInitAssignSDDLString", status);
+        return status;
+    }
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
 
@@ -1058,6 +1219,15 @@ XpmxEvtDeviceAdd(
     context->InterruptChannel.Name = "HID Interrupt";
     KeInitializeSpinLock(&context->InterruptChannel.Lock);
 
+    WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
+    lockAttributes.ParentObject = device;
+    status = WdfWaitLockCreate(&lockAttributes, &sessionLock);
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfWaitLockCreate(SessionLock)", status);
+        return status;
+    }
+    context->SessionLock = sessionLock;
+
     status = WdfFdoQueryForInterface(
         device,
         &GUID_BTHDDI_PROFILE_DRIVER_INTERFACE,
@@ -1074,10 +1244,41 @@ XpmxEvtDeviceAdd(
 
     context->ProfileInterfaceReady = TRUE;
 
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(
+        &queueConfig,
+        WdfIoQueueDispatchSequential
+        );
+    queueConfig.EvtIoDeviceControl = XpmxEvtIoDeviceControl;
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&queueAttributes);
+    queueAttributes.ParentObject = device;
+    queueAttributes.ExecutionLevel = WdfExecutionLevelPassive;
+
+    status = WdfIoQueueCreate(
+        device,
+        &queueConfig,
+        &queueAttributes,
+        &queue
+        );
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfIoQueueCreate(Control)", status);
+        return status;
+    }
+
+    status = WdfDeviceCreateDeviceInterface(
+        device,
+        &GUID_DEVINTERFACE_XPMX_CONTROL,
+        NULL
+        );
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfDeviceCreateDeviceInterface(Control)", status);
+        return status;
+    }
+
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
         DPFLTR_INFO_LEVEL,
-        "[XP-Mx210BL] Profile driver attached to the controller HID service node\n"
+        "[XP-Mx210BL] Profile driver attached; manual Connect interface registered\n"
         );
 
     return STATUS_SUCCESS;
@@ -1091,51 +1292,34 @@ XpmxEvtSelfManagedIoInit(
     NTSTATUS status;
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
 
+    status = WdfWaitLockAcquire(context->SessionLock, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    InterlockedExchange(&context->DeviceStopping, 0);
     XpmxResetChannel(&context->ControlChannel);
     XpmxResetChannel(&context->InterruptChannel);
     context->DeviceInfoReady = FALSE;
 
-    // VHF is created and started for each PnP start cycle. This keeps the
-    // virtual HID child lifecycle paired with this Bluetooth service node.
+    // VHF remains alive across ordinary controller disconnects. It is
+    // recreated only when Windows restarts this parent PnP device.
     status = XpmxStartVirtualGamepad(context);
     if (!NT_SUCCESS(status)) {
-        // Keep the Bluetooth transport available for diagnostics even if
-        // virtual-HID initialization fails.
         DbgPrintEx(
             DPFLTR_IHVDRIVER_ID,
             DPFLTR_WARNING_LEVEL,
-            "[XP-Mx210BL] VHF initialization failed; Bluetooth receive probe will continue\n"
+            "[XP-Mx210BL] VHF initialization failed; Bluetooth connection attempt will continue\n"
             );
     }
 
-    status = XpmxGetRemoteDeviceInfo(context);
+    // One normal initial attempt on PnP start; no timer or polling loop.
+    status = XpmxConnectHidSession(context, "PnP start");
     if (!NT_SUCCESS(status)) {
-        // Keep the PnP node started so diagnostics remain available.
-        return STATUS_SUCCESS;
+        XpmxLogStatus("Initial HID session connection", status);
     }
 
-    status = XpmxOpenL2capChannel(context, &context->ControlChannel);
-    if (!NT_SUCCESS(status)) {
-        return STATUS_SUCCESS;
-    }
-
-    status = XpmxOpenL2capChannel(context, &context->InterruptChannel);
-    if (!NT_SUCCESS(status)) {
-        XpmxCloseL2capChannel(context, &context->ControlChannel);
-        return STATUS_SUCCESS;
-    }
-
-    DbgPrintEx(
-        DPFLTR_IHVDRIVER_ID,
-        DPFLTR_INFO_LEVEL,
-        "[XP-Mx210BL] Both HID L2CAP channels are open. Probe milestone passed.\n"
-        );
-
-    status = XpmxStartInterruptReader(context);
-    if (!NT_SUCCESS(status)) {
-        XpmxLogStatus("Start continuous HID Interrupt reader", status);
-    }
-
+    WdfWaitLockRelease(context->SessionLock);
     return STATUS_SUCCESS;
 }
 
@@ -1144,7 +1328,17 @@ XpmxEvtSelfManagedIoCleanup(
     _In_ WDFDEVICE Device
     )
 {
+    NTSTATUS status;
     PDEVICE_CONTEXT context = GetDeviceContext(Device);
+
+    // Reject new user requests before waiting for any in-flight connect.
+    InterlockedExchange(&context->DeviceStopping, 1);
+
+    status = WdfWaitLockAcquire(context->SessionLock, NULL);
+    if (!NT_SUCCESS(status)) {
+        XpmxLogStatus("WdfWaitLockAcquire(Cleanup)", status);
+        return;
+    }
 
     // Stop and drain the pending read before deleting VHF or closing channels.
     XpmxStopInterruptReader(context);
@@ -1154,12 +1348,14 @@ XpmxEvtSelfManagedIoCleanup(
 
     // Close in reverse-open order. Handles are invalidated by the channel
     // callback as soon as a remote disconnect is observed.
-    XpmxCloseL2capChannel(context, &context->InterruptChannel);
-    XpmxCloseL2capChannel(context, &context->ControlChannel);
+    (VOID)XpmxCloseL2capChannel(context, &context->InterruptChannel);
+    (VOID)XpmxCloseL2capChannel(context, &context->ControlChannel);
 
     // Keep the request alive until both channel-close operations have
     // completed, so a late disconnect callback cannot touch a deleted request.
     XpmxUninitializeInterruptReader(context);
+
+    WdfWaitLockRelease(context->SessionLock);
 }
 
 NTSTATUS
