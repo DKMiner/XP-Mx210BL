@@ -850,6 +850,7 @@ XpmxReadCompletion(
             // VHF's HID_XFER_PACKET reportBuffer includes the report ID byte,
             // while reportId also identifies that same ID.
             if (bytesRead == XPMX_GAMEPAD_PACKET_LENGTH &&
+                (bytesRead - 1) == XPMX_VHF_REPORT_BUFFER_LENGTH &&
                 reader->Buffer[0] == XPMX_HIDP_INPUT &&
                 reader->Buffer[1] == XPMX_GAMEPAD_REPORT_ID &&
                 reader->DeviceContext->VhfHandle != NULL &&
