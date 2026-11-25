@@ -36,3 +36,10 @@ VHF is the intended way to expose the controller's validated input reports as a 
 ## Compatibility note
 
 The Microsoft Bluetooth Echo sample and VHF docs are the starting points, not proof that the XP-Mx210BL will work with the prototype. The prototype will log actual BRB completion statuses on the user's Intel adapter before adding HIDP and VHF behavior.
+
+
+## Signing and current project status
+
+Microsoft's Hardware Developer Program enrollment requirements and the current project decision are recorded in [RELEASE-AND-SIGNING.md](RELEASE-AND-SIGNING.md). As of 2026-11-25, public signing is paused because the documented enrollment route is organization-based and the project has no eligible organization account. The code remains a machine-tested, locally test-signed prototype; that is not a normal-mode production package.
+
+Memory Integrity (HVCI) is a separate VBS feature. Microsoft requires drivers to use NX-compatible memory, avoid writable-executable sections and dynamic kernel code, and be tested with HVCI enabled. The project's source-level use of NX pool is not a formal compatibility result. See the [Microsoft HVCI driver compatibility guide](https://learn.microsoft.com/en-us/windows-hardware/test/hlk/testref/driver-compatibility-with-device-guard).
