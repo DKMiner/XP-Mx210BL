@@ -47,7 +47,9 @@ Example neutral report observed:
 A1 07 80 80 80 80 88 00 00 00 00 00
 ```
 
-The exact 208-byte descriptor should be added to `protocol/xp-mx210bl-home-x-report-descriptor.bin` (and a human-readable hex dump alongside it) before implementing the VHF HID descriptor. It is not reconstructed or fabricated in this repository.
+The exact 208-byte descriptor was extracted from the Android HCI snoop capture's SDP HIDDescriptorList attribute 0x0206 (descriptor type 0x22) and is preserved in `protocol/xp-mx210bl-home-x-report-descriptor.bin` with a human-readable hex dump. Its SHA-256 is `23d374412356a5abef40af844f9ec9fec67b282092f97f43f4df843809df1f58`.
+
+The 97-byte Game Pad-only collection slice used by the VHF child is preserved separately as `protocol/xp-mx210bl-home-x-gamepad-report-descriptor.bin` and a hex dump. Its SHA-256 is `4e5d0e6f151961e6dc0d965b9bc924db2340b6614b5a846d033986a307306d1f`. It is an exact slice of the original descriptor, not a rewritten or guessed report definition.
 
 ## Windows failure evidence
 
@@ -119,14 +121,26 @@ A later capture included multiple cycles of remote disconnect indications, devic
 
 These logs establish that the Windows Bluetooth stack can open both HID L2CAP channels through the custom profile driver. They do not establish that HIDP control transactions or input-report reception work yet.
 
-### Stage 2 receive probe
+### Stage 2 receive probe — hardware-tested
 
-The next code revision adds:
+The Stage 2 reader was built and installed on the target laptop. Its DebugView capture recorded 229 complete 12-byte Interrupt-channel packets. Every packet began with `A1 07` (HIDP DATA/INPUT, Report ID 0x07), and 150 distinct packet patterns appeared while buttons and sticks were exercised. The reports included the previously observed neutral sample:
 
-- Separate per-channel state and handles.
-- Remote-disconnect handling that invalidates only the affected channel handle and sets CloseNow.
-- Cancellation and rundown of a pending inbound BRB_L2CA_ACL_TRANSFER read on the Interrupt channel.
-- Re-submission of the read after successful completion.
-- Logging of the transfer length, remaining buffer size, and first 16 bytes.
+```text
+A1 07 80 80 80 80 88 00 00 00 00 00
+```
 
-The Stage 2 revision is committed but has not yet been built or hardware-tested on the target laptop. The next test must confirm the actual HIDP bytes received from the controller before HIDP parsing and VHF work proceed.
+The changing values in the axis, hat, and button portions match the HOME+X Game Pad report collection from the Android descriptor. This confirms that actual gamepad input reaches the custom Windows profile driver over the laptop's built-in Intel Bluetooth adapter.
+
+The receive logger was subsequently changed to print each packet as one compact DebugView line rather than one line per byte.
+
+### Stage 3 VHF bridge — implementation committed, target build pending
+
+The next source revision adds:
+
+- The exact 97-byte Game Pad-only report descriptor (a byte-for-byte slice of the original 208-byte descriptor).
+- VHF create/start/delete lifecycle paired with the Bluetooth service node's self-managed I/O lifecycle.
+- The required `vhf` lower-filter registration in the profile driver's INF and linkage to `VhfKm.lib`.
+- Validation of the incoming 12-byte `A1 07` HIDP input packet.
+- Forwarding to VHF using Report ID 0x07 and the remaining 11 bytes (including the report-ID byte) through `HID_XFER_PACKET` / `VhfReadReportSubmit`.
+
+The VHF source revision is committed but has not yet been built or hardware-tested on the target laptop. The next action is a clean Debug | x64 rebuild, package/catalog verification, and then a controlled hardware test. Do not install this revision until that build and package verification succeed.
