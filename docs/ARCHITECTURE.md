@@ -39,7 +39,7 @@ A normal connection attempt:
 5. Starts a pending inbound BRB_L2CA_ACL_TRANSFER request on the Interrupt channel.
 6. After each successful read, the completion routine queues a DPC that re-submits the read.
 
-The profile callback is channel-specific. When a remote disconnect is indicated, it invalidates the affected channel handle, sets the CloseNow response so the Bluetooth stack can finish tearing down that channel, and cancels the pending Interrupt read when appropriate. Ordinary controller disconnects do not delete the VHF child.
+The profile callback is channel-specific. When a remote disconnect is indicated, it invalidates the affected channel handle, sets the CloseNow response so the Bluetooth stack can finish tearing down that channel, and cancels the pending Interrupt read when appropriate. A lost HID channel makes the complete gamepad session unusable, so a PASSIVE_LEVEL work item stops the reader, closes any remaining channel, deletes the VHF child, and requests a full Bluetooth ACL disconnect. A later explicit Connect request creates a fresh VHF child after both channels open.
 
 There are exactly two connection triggers in the current design:
 
