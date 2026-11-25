@@ -90,8 +90,9 @@ The driver performs one connection attempt on PnP start. After a controller-side
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\XpMx210BL-Connect.ps1
    ~~~
    It requests elevation automatically if the current PowerShell session is not elevated.
-4. Click **Connect** once.
-5. A successful request should display a success message and DebugView should show:
+4. Alternatively, launch the helper directly by double-clicking `tools\\Launch-XpMx210BL-Connect.cmd`. It starts the same PowerShell/WinForms helper with its console hidden; Windows still displays a UAC prompt when elevation is needed.
+5. Click **Connect** once.
+6. A successful request should display a success message and DebugView should show:
    ~~~text
    [XP-Mx210BL] Connect attempt requested (user request); no background retry is scheduled
    [XP-Mx210BL] HID Control opened: PSM=0x0011 ...
