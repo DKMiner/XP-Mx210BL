@@ -282,6 +282,9 @@ XpmxL2capIndicationCallback(
         HANDLE disconnectedHandle = Parameters->ConnectionHandle;
         BOOLEAN matched;
 
+        // This driver is abandoning the channel after a remote disconnect.
+        Parameters->Parameters.Disconnect.CloseNow = TRUE;
+
         KeAcquireSpinLock(&channel->Lock, &oldIrql);
 
         matched = (channel->Handle == NULL ||
@@ -685,7 +688,8 @@ XpmxLogInterruptPacket(
     )
 {
     ULONG i;
-    ULONG bytesToLog = min(Length, XPMX_RX_LOG_BYTES);
+    ULONG bytesToLog = (Length < XPMX_RX_LOG_BYTES) ?
+        Length : XPMX_RX_LOG_BYTES;
 
     DbgPrintEx(
         DPFLTR_IHVDRIVER_ID,
